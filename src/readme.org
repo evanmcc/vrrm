@@ -1,0 +1,20 @@
+#+TITLE: VRRM design
+* structure
+- ha_supervisor:
+  - mostly just has the same supervisor API, maybe simplified a little
+  - when the vrrm app is started, the supervisor tries to form an
+    ensemble with all other supervisors (vrrm_ha_sup) on everything in
+    nodes()
+  - allows users to start new replicated fsms on all nodes or a subset
+    (3, 5, etc)
+  - manages failure detection for the ensembles that it and
+    propagation of participation information to them.
+- vrrm_fsm:
+  - each is its own ensemble
+  - degenerate state-keeping, on repair, just transfer the entire
+    serialized state of the behavior implementation and most of our own.
+* rationale
+a library designed for distributed systems that require concurrency,
+but in a fairly lightweight way (i.e. state is easy to recover or
+repair, FSMs have fairly regular checkpoints where log tails may be
+discarded).  It's currently unclear if this is actually a good idea!
