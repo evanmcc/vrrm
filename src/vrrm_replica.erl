@@ -274,7 +274,7 @@ handle_cast(#prepare_ok{view = View, op = Op, sender = Sender} = Msg,
     %% do we have f replies? if no, wait for more (or timeout)
     F = f(State?S.config),
     OKs = scan_pend(prepare_ok, Op, View, Pending),
-    lager:debug("~p prepare_ok: ~p, ~p N ~p F ~p",
+    lager:info("~p prepare_ok: ~p, ~p N ~p F ~p",
                [self(), Msg, Pending, OKs, F]),
     case length(OKs ++ [Msg]) of
         N when N >= F ->
@@ -478,11 +478,13 @@ f(Config) ->
 
 %% manually unroll this because the compiler is not smart
 scan_pend(prepare_ok, Op, View, Pending) ->
-    [R || #prepare_ok{view = V, op = O} = R <- Pending,
-          O == Op, V == View].
+    [R || {#prepare_ok{view = V, op = O} = R, _} <- Pending,
+          O == Op andalso V == View];
+scan_pend(_Msg, _Op, _View, _Pending) ->
+    error(unimplemented).
 
 clean_pend(prepare_ok, Op, View, Pending) ->
-    [R || #prepare_ok{view = V, op = O} = R <- Pending,
+    [R || {#prepare_ok{view = V, op = O} = R, _} <- Pending,
           O == Op, V == View];
 clean_pend(_Msg, _Op, _View, _Pending) ->
     error(unimplemented).

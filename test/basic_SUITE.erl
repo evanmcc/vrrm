@@ -44,7 +44,7 @@ blackboard(Config) ->
                                          [], true, #{}),
              R
          end
-         || _ <- lists:seq(1, 3)],
+         || _ <- lists:seq(1, 5)],
 
     Replicas = lists:sort(Replicas0),
     [vrrm_replica:initial_config(R, Replicas)
@@ -59,6 +59,13 @@ blackboard(Config) ->
     {ok, ok} = vrrm_replica:request(Primary, {put, foo, bar}, 1),
     %% test idempotency of requests
     {ok, ok} = vrrm_replica:request(Primary, {put, foo, bar}, 1),
+    %% check here that op/commit are the same as before
     {ok, bar} = vrrm_replica:request(Primary, {get, foo}, 2),
+
+    [begin
+         S = sys:get_status(R),
+         lager:debug("state ~p", [S])
+     end
+     || R <- Replicas],
 
     Config.
