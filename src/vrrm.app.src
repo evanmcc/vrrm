@@ -1,11 +1,26 @@
 {application, vrrm,
- [{description, "Viewstamped replication consensus library"},
-  {vsn, "0.1.0"},
+ [{description, "Viewstamped replication (revisited) consensus library"},
+  {vsn, semver},
   {registered, []},
   {applications,
-   [kernel,
-    stdlib
+   [
+    kernel,
+    stdlib,
+    lager
    ]},
-  {env,[]},
+  {env,
+   [
+    %% how often a primary node that has gotten no requests sends a
+    %% commit message to its replicas
+    {idle_commit_interval, 2500}, % 2.5 seconds
+    %% how long to wait until we assume that a primary that hasn't
+    %% talked to us is partitioned or dead, thus causing us to start a
+    %% view change
+    %% NB! MUST be larger than idle_commit_interval!
+    {primary_failure_interval, 4000}, % 4 seconds
+    %% how many ops do we commit before we update the snapshot and
+    %% compact the log
+    {snapshot_op_interval, 10}
+   ]},
   {modules, []}
  ]}.

@@ -7,12 +7,14 @@ suite() ->
 
 init_per_suite(Config) ->
     ok = lager:start(),
+    ok = application:start(vrrm),
     lager_common_test_backend:bounce(info),
     Config.
 
 end_per_suite(_Config) ->
     %% poorly behaved tests will leak processes here, we should expend
     %% some effort to find them and shut them down
+    ok = application:stop(vrrm),
     ok.
 
 groups() ->
