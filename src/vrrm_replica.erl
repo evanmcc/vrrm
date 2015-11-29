@@ -63,6 +63,7 @@
         {
           view :: non_neg_integer(),
           epoch :: non_neg_integer(),
+          sender :: pid(),
           payload :: term()
         }).
 
@@ -125,6 +126,7 @@
           old_config :: [atom()],
 
           pending_replies = [] :: [],
+          nonce :: binary(),
 
           %% callback module state
           mod :: atom(),
@@ -152,7 +154,12 @@ request(Primary, Command, Request) ->
     request(Primary, Command, Request, 500).
 
 request(Primary, Command, Request, Timeout) ->
-    gen_server:call(Primary, {request, Command, self(), Request}, Timeout).
+    try
+        gen_server:call(Primary, {request, Command, self(), Request}, Timeout)
+    catch C:E ->
+            lager:info("req to ~p:~p", [C,E]),
+            {error, timeout}
+    end.
 
 initial_config(Replica, Config) ->
     gen_server:call(Replica, {initial_config, Config}, infinity).
@@ -163,7 +170,7 @@ initial_config(Replica, Config) ->
                   op :: non_neg_integer(), commit :: non_neg_integer()}).
 prepare(Replica, View, Command, Client, Request, Op, Commit, Epoch) ->
     gen_server:cast(Replica,
-                    #msg{view = View, epoch = Epoch,
+                    #msg{view = View, epoch = Epoch, sender = self(),
                          payload =
                              #prepare{primary = self(), op = Op,
                                       client = Client, request = Request,
@@ -172,7 +179,7 @@ prepare(Replica, View, Command, Client, Request, Op, Commit, Epoch) ->
 -record(prepare_ok, {op :: non_neg_integer(), sender :: pid(),
                      view :: non_neg_integer()}).
 prepare_ok(Replica, View, Op, Epoch) ->
-    gen_server:cast(Replica, #msg{view = View, epoch = Epoch,
+    gen_server:cast(Replica, #msg{view = View, epoch = Epoch, sender = self(),
                                   payload =
                                       #prepare_ok{op = Op,
                                                   %% not sure if this
@@ -182,14 +189,14 @@ prepare_ok(Replica, View, Op, Epoch) ->
 
 -record(commit, {commit :: non_neg_integer()}).
 commit(Replica, Commit, View, Epoch) ->
-    gen_server:cast(Replica, #msg{view = View, epoch = Epoch,
+    gen_server:cast(Replica, #msg{view = View, epoch = Epoch, sender = self(),
                                   payload =
                                       #commit{commit = Commit}}).
 
 -record(start_view_change, {view :: non_neg_integer(), sender :: pid(),
                             epoch :: non_neg_integer()}).
 start_view_change(Replica, View, Epoch) ->
-    gen_server:cast(Replica, #msg{view = View, epoch = Epoch,
+    gen_server:cast(Replica, #msg{view = View, epoch = Epoch, sender = self(),
                                   payload =
                                       #start_view_change{view = View,
                                                          epoch = Epoch,
@@ -199,7 +206,7 @@ start_view_change(Replica, View, Epoch) ->
                          old_view :: non_neg_integer(), op :: non_neg_integer(),
                          commit :: non_neg_integer(), sender :: pid()}).
 do_view_change(NewPrimary, View, Log, OldView, Op, Commit, Epoch) ->
-    gen_server:cast(NewPrimary, #msg{view = View, epoch = Epoch,
+    gen_server:cast(NewPrimary, #msg{view = View, epoch = Epoch, sender = self(),
                                      payload =
                                          #do_view_change{view = View,
                                                          log = Log,
@@ -211,11 +218,30 @@ do_view_change(NewPrimary, View, Log, OldView, Op, Commit, Epoch) ->
 -record(start_view, {view :: non_neg_integer(), log :: term(),
                      op :: non_neg_integer(), commit :: non_neg_integer()}).
 start_view(Replica, View, Log, Op, Commit, Epoch) ->
-    gen_server:cast(Replica, #msg{view = View, epoch = Epoch,
+    gen_server:cast(Replica, #msg{view = View, epoch = Epoch, sender = self(),
                                   payload =
                                       #start_view{view = View, log = Log,
                                                   op = Op, commit = Commit}}).
 
+out_of_date(Replica, View, Epoch) ->
+    gen_server:cast(Replica, #msg{view = View, epoch = Epoch, sender = self(),
+                                  payload = out_of_date}).
+
+-record(recovery, {nonce :: binary()}).
+recovery(Replica, Nonce, View, Epoch) ->
+    gen_server:cast(Replica, #msg{view = View, epoch = Epoch, sender = self(),
+                                  payload =
+                                      #recovery{nonce = Nonce}}).
+
+-record(recovery_response, {nonce :: binary(), log :: [term()],
+                            op :: non_neg_integer(),
+                            commit :: non_neg_integer()}).
+recovery_response(Replica, View, Nonce, Log, Op, Commit, Epoch) ->
+    gen_server:cast(Replica, #msg{view = View, epoch = Epoch, sender = self(),
+                                  payload =
+                                      #recovery_response{nonce = Nonce, op = Op,
+                                                         log = Log,
+                                                         commit = Commit}}).
 %%%===================================================================
 %%% gen_server callbacks
 %%%===================================================================
@@ -301,12 +327,19 @@ handle_call(_Request, _From, State) ->
     lager:warning("unexpected call ~p from ~p", [_Request, _From]),
     {noreply, State}.
 
-handle_cast(#msg{view = View, epoch = Epoch} = Msg,
+handle_cast(#msg{view = View, epoch = Epoch, sender = Sender} = Msg,
             ?S{view = LocalView, epoch = LocalEpoch} = State)
   when LocalEpoch > Epoch; LocalView > View ->
     %% ignore these, as they're invalid under the current protocol
-    lager:info("discarding message with old view or epoch: ~p, ~p",
-               [Msg, State]),
+    lager:info("~p discarding message with old view or epoch: ~p",
+               [self(), Msg]),
+    out_of_date(Sender, LocalView, LocalEpoch),
+    {noreply, State};
+handle_cast(#msg{payload = Payload} = Msg, ?S{status=recovering} = State)
+  when not is_record(Payload, recovery) andalso
+       not is_record(Payload, recovery_response) ->
+    %% ignore other protocols when we're in recovery mode.
+    lager:info("~p discarding non-recovery message: ~p", [self(), Msg]),
     {noreply, State};
 handle_cast(#msg{payload = #prepare{primary = Primary, command = Command,
                                     client = Client, request = Request,
@@ -406,15 +439,15 @@ handle_cast(#msg{payload=#start_view_change{}, view=View, epoch=Epoch},
         end,
     %% reset interval change to avoid storm?
     {noreply, State?S{status = Status1, last_normal = LastNormal1,
-                      config = Config1}, replica_timeout()};
+                      view = View, config = Config1}, replica_timeout()};
 handle_cast(#msg{payload = #do_view_change{view = View} = Msg},
             ?S{pending_replies = Pending, epoch = Epoch,
                log = Log, config = Config, commit = Commit} = State) ->
     %% have we gotten f + 1 (inclusive of self)? if no, wait
     F = f(State?S.config),
     OKs0 = scan_pend(do_view_change, ignore, View, Pending),
-    lager:info("~p do_view_change: ~p, ~p N ~p F ~p",
-               [self(), Msg, length(Pending), length(OKs0) + 1, F + 1]),
+    lager:info("~p do_view_change: ~p N ~p F ~p",
+               [self(), length(Pending), length(OKs0) + 1, F + 1]),
     OKs = [Msg | Pending],
     HasSelf = has_self(OKs, self()),
     case length(OKs) of
@@ -424,7 +457,7 @@ handle_cast(#msg{payload = #do_view_change{view = View} = Msg},
             %% largest op_num.  set commit number to largest number in the
             %% result set, return status to normal, and send start_view to all
             %% other replicas (maybe compacting log first)
-            lager:info("OKs: ~p", [OKs]),
+            %% lager:info("OKs: ~p", [OKs]),
             HighestOp = get_highest_op(OKs),
             HighOp = HighestOp#do_view_change.op,
             HighLog = HighestOp#do_view_change.log,
@@ -432,6 +465,7 @@ handle_cast(#msg{payload = #do_view_change{view = View} = Msg},
             HighCommit = get_highest_commit(OKs),
             [start_view(Replica, View, HighLog, HighOp, HighCommit, Epoch)
              || Replica <- Config, is_pid(Replica)],
+            lager:info("~p view change successful", [self()]),
             {noreply, State?S{status = normal, op = HighOp,
                               primary = true, commit = HighCommit}};
                               %% next_state = NextState, mod_state = ModState}};
@@ -457,14 +491,68 @@ handle_cast(#msg{payload=#start_view{view = View, log = Log, op = Op,
      || PrepOp <- lists:seq(Commit + 1, Op)],
     {noreply, State?S{op = Op, view = View, status = normal,
                       mod_state = ModState1, next_state = NextState1}};
-%% handle_cast({recovery, Sender, Nonce, Epoch},
-%%             State) ->
-%%     %% if status is normal, send recovery_response
-%%     %% if primary, include additional information
-%% handle_cast({recovery_response, View, Nonce, Log, Op, Commit, Sender, Epoch},
-%%             State) ->
-%%     %% have we got f + 1 incuding the primary response? if no wait
-%%     %% if yes, use primary values, set to normal, restart participation
+handle_cast(#msg{payload=out_of_date, view = View, epoch = Epoch},
+            ?S{config = Config} = State) ->
+    %% moderately sure that epoch handling here is wrong.  how to test?
+    lager:info("~p out_of_date", [self()]),
+    Nonce = crypto:rand_bytes(16),
+    [recovery(Replica, Nonce, View, Epoch)
+     || Replica <- Config, is_pid(Replica), Replica /= self()],
+    {noreply, State?S{view = View, epoch = Epoch,
+                      status = recovering, nonce = Nonce}};
+handle_cast(#msg{payload=#recovery{nonce = Nonce}, sender = Sender},
+            ?S{primary = false, view = View, epoch = Epoch} = State) ->
+    %% if status is normal, send recovery_response
+    lager:info("~p recovery, non-primary", [self()]),
+    recovery_response(Sender, View, Nonce, undefined,
+                      undefined, undefined, Epoch),
+    {noreply, State};
+handle_cast(#msg{payload=#recovery{nonce = Nonce}, sender = Sender},
+            ?S{primary = true, view = View, log = Log0,
+               op = Op, commit = Commit, epoch = Epoch} = State) ->
+    %% if primary, include additional information
+    lager:info("~p recovery, primary", [self()]),
+    Log = ship_log(Log0),
+    recovery_response(Sender, View, Nonce, Log, Op, Commit, Epoch),
+    {noreply, State};
+handle_cast(#msg{payload=#recovery_response{nonce = Nonce} = Msg,
+                 view = View, sender = Sender, epoch = Epoch},
+            ?S{log = LocalLog, commit = LocalCommit, mod = Mod,
+               next_state = NextState, mod_state = ModState,
+               pending_replies = Pending} = State) ->
+    lager:info("~p recovery_response ~p", [self(), Sender]),
+    %% have we got f + 1 incuding the primary response? if no wait
+    F = f(State?S.config),
+    OKs0 = scan_pend(recovery_response, Nonce, View, Pending),
+    lager:info("~p recovery_response: ~p, ~p N ~p F ~p",
+               [self(), Msg, length(Pending), length(OKs0) + 1, F + 1]),
+    OKs = [Msg | Pending],
+    {Primary, HasPrimary} = has_primary(OKs),
+    case length(OKs) of
+        N when N >= F + 1 andalso HasPrimary ->
+            #recovery_response{log = Log, op = Op, commit = Commit} = Primary,
+            %% if yes, use primary values, set to normal, restart participation
+            _ = trunc_uncommitted(LocalLog, LocalCommit),
+            Commits = sync_log(LocalCommit, LocalLog, Op, Log),
+            {NextState1, ModState1} = do_upcalls(Mod, NextState, ModState, LocalLog,
+                                                 Commits),
+            %% if we're the recovering primary of this quorum, we need
+            %% to initiate another view change
+            View1 =
+                case State?S.primary of
+                    true ->
+                        [start_view_change(R, View + 1, Epoch)
+                         || R <- State?S.config],
+                        View + 1;
+                    _ -> View
+                end,
+            lager:info("~p recover successful", [self()]),
+            {noreply, State?S{status = normal, next_state = NextState1,
+                              mod_state = ModState1, op = Op,
+                              commit = Commit, view = View1}};
+        _ ->
+            {noreply, State?S{pending_replies = [Msg|Pending]}}
+    end;
 %% handle_cast({reconfiguration, Epoch, Client, Request, NewConfig},
 %%             State) ->
 %%     %% validate new config, Epoch == epoch, and Request is not already
@@ -485,14 +573,14 @@ handle_cast(#msg{payload=#start_view{view = View, log = Log, op = Op,
 %%     %% if we've gotten f + 1 of these, we die.
 %%     %% if we don't get enough in time, we re-send start_epoch to new nodes
 handle_cast(_Msg, State) ->
-    lager:warning("unexpected cast ~p", [_Msg]),
+    lager:warning("~p unexpected cast ~p", [self(), _Msg]),
     {noreply, State}.
 
 handle_info(timeout, ?S{primary = true, view = View, epoch = Epoch,
                         commit = Commit, config = Config} = State) ->
     %% send commit message to all replicas
     [commit(R, Commit, View, Epoch)
-     || R <- Config],
+     || R <- Config, is_pid(R), R /= self()],
     {noreply, State};
 handle_info(Msg, ?S{primary = false, view = View, epoch = Epoch} = State)
   when Msg =:= timeout -> % need to monitor primary and catch monitor
@@ -632,14 +720,14 @@ scan_pend(prepare_ok, Op, View, Pending) ->
     lager:debug("scan ~p ~p ~p", [Op, View, Pending]),
     [R || #prepare_ok{view = V, op = O} = R <- Pending,
           O == Op andalso V == View];
-scan_pend(start_view_change, _Op, View, Pending) ->
-    lager:debug("scan ~p ~p", [View, Pending]),
-    [R || #start_view_change{view = V} = R <- Pending,
-          V == View];
 scan_pend(do_view_change, _Op, View, Pending) ->
     lager:debug("scan ~p ~p", [View, Pending]),
     [R || #do_view_change{view = V} = R <- Pending,
           V == View];
+scan_pend(recovery_response, Nonce, _, Pending) ->
+    lager:info("scan ~p ~p", [Nonce, Pending]),
+    [R || #recovery_response{nonce = N} = R <- Pending,
+          N =/= Nonce];
 scan_pend(_Msg, _Op, _View, _Pending) ->
     error(unimplemented).
 
@@ -668,6 +756,14 @@ update_log_commit_state(Op, Log) ->
 ship_log(Log) ->
     ets:foldl(fun(X, Acc) -> [X|Acc] end, [], Log).
 
+trunc_uncommitted(Log, Commit) ->
+    case ets:lookup(Log, Commit) of
+        [_] ->
+            ets:delete(Log, Commit + 1);
+        [] ->
+            ok
+    end.
+
 sync_log(OldCommit, OldLog, NewOpNum, NewLog) ->
     %% get a list of ops
     Ops0 =
@@ -691,6 +787,7 @@ sync_log(OldCommit, OldLog, NewOpNum, NewLog) ->
                  %% assert that commands are the same for safety
                  NewCmd = NewOp#operation.command,
                  OldCmd = OldOp#operation.command,
+                 lager:info("~p n ~p o ~p", [Op, NewCmd, OldCmd]),
                  NewCmd = OldCmd,
                  Op
          end
@@ -736,6 +833,14 @@ has_self([_|T], Self) ->
     has_self(T, Self);
 has_self([], _) ->
     false.
+
+has_primary([]) ->
+    {meh, false};
+has_primary([#recovery_response{log=Log}=P|_T]) when Log =/= undefined->
+    {P, true};
+has_primary([_|T]) ->
+    has_primary(T).
+
 
 fail_primary(Config) ->
     fail_primary(Config, first, []).

@@ -70,15 +70,21 @@ blackboard(Config) ->
 
     %% kill the primary
     sys:suspend(Primary),
-    timer:sleep(3000), % lower the timeouts?
+    timer:sleep(1000), % lower the timeouts?
 
     %% make a request to all others and make sure that it works
     Replies = [vrrm_replica:request(R, {get, foo}, 3)
                || R <- Rest],
 
     lager:info("replies: ~p", [Replies]),
-
     %% compare all the module state to make sure that it matches
+
+    [Primary2|_] = Rest,
+    {ok, ok} = vrrm_replica:request(Primary2, {put, baz, quux}, 4),
+    sys:resume(Primary),
+
+    {error, timeout} = vrrm_replica:request(Primary, {get, baz}, 5),
+    {ok, quux} = vrrm_replica:request(Primary, {get, baz}, 5),
 
     %% allow the primary to recover
     [begin
