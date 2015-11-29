@@ -20,7 +20,7 @@
 %%% messages
 -export([
          %% async
-         prepare/6,
+         prepare/8,
          prepare_ok/4,
          commit/4,
 
@@ -158,13 +158,15 @@ initial_config(Replica, Config) ->
     gen_server:call(Replica, {initial_config, Config}, infinity).
 
 %% internal messages
--record(prepare, {primary :: pid, command :: term(),
+-record(prepare, {primary :: pid(), command :: term(),
+                  client :: pid(), request :: non_neg_integer(),
                   op :: non_neg_integer(), commit :: non_neg_integer()}).
-prepare(Replica, View, Command, Op, Commit, Epoch) ->
+prepare(Replica, View, Command, Client, Request, Op, Commit, Epoch) ->
     gen_server:cast(Replica,
                     #msg{view = View, epoch = Epoch,
                          payload =
                              #prepare{primary = self(), op = Op,
+                                      client = Client, request = Request,
                                       command = Command, commit = Commit}}).
 
 -record(prepare_ok, {op :: non_neg_integer(), sender :: pid(),
@@ -219,6 +221,7 @@ start_view(Replica, View, Log, Op, Commit, Epoch) ->
 %%%===================================================================
 
 init([Mod, ModArgs, New, _Opts]) ->
+    random:seed(erlang:unique_integer()),
     case New of
         true ->
             {ok, NextState, ModState} = Mod:init(ModArgs),
@@ -244,6 +247,8 @@ handle_call({request, Command, Client, Request},
                view = View, op = Op, epoch = Epoch,
                client_table = Table, config = Config} = State) ->
     %% are we primary? ignore (or reply not_primary?) if not
+    lager:info("~p request: command ~p client ~p request ~p",
+               [self(), Command, Client, Request]),
     case Primary of
         false ->
             {reply, not_primary, State};
@@ -269,25 +274,24 @@ handle_call({request, Command, Client, Request},
                                              req_num = Request,
                                              from = From},
                     _ = add_request(ClientRecord, RequestRecord, Table),
-                    [prepare(Replica, View,
-                             Command, Op1, Commit, Epoch)
-                     || Replica <- Config, Replica /= self()],
-                    Timeout = vrrm:config(idle_commit_interval),
-                    {noreply, State?S{op = Op1}, Timeout}
+                    [prepare(Replica, View, Command, Client, Request,
+                             Op1, Commit, Epoch)
+                     || Replica <- Config, Replica /= self(), is_pid(Replica)],
+                    {noreply, State?S{op = Op1}, primary_timeout()}
             end
     end;
 handle_call({initial_config, Config}, _From, State) ->
     %% should check that we're in unconfigured+config=undefined
-    [Primary | _] = Config,
+    [Primary | _] = Config,  %% maybe OK?
     AmPrimary = self() =:= Primary,
     lager:info("~p inserting initial configuration, primary: ~p, ~p",
                [self(), Primary, AmPrimary]),
     Timeout =
         case AmPrimary of
             true ->
-                vrrm:config(idle_commit_interval);
+                primary_timeout();
             false ->
-                vrrm:config(primary_failure_interval)
+                replica_timeout()
         end,
     {reply, ok, State?S{config = Config,
                         status=normal,
@@ -305,6 +309,7 @@ handle_cast(#msg{view = View, epoch = Epoch} = Msg,
                [Msg, State]),
     {noreply, State};
 handle_cast(#msg{payload = #prepare{primary = Primary, command = Command,
+                                    client = Client, request = Request,
                                     op = Op, commit = Commit},
                  view = View} = Msg,
             State0) ->
@@ -312,16 +317,22 @@ handle_cast(#msg{payload = #prepare{primary = Primary, command = Command,
     %% is log complete? consider state transfer if not
     %% if CommitNum is higher than commit_num, do some upcalls
     State = maybe_catchup(Commit, State0),
+    Table = State?S.client_table,
+    ClientRecord = get_client(Client, Table),
+    RequestRecord = #request{op = Op,
+                             view = View,
+                             req_num = Request},
+    _ = add_request(ClientRecord, RequestRecord, Table),
     %% increment op number, append operation to log, update client table(?)
     Entry = #operation{num = Op,
+                       client = Client,
                        view = View,
                        command = Command},
     _ = add_log_entry(Entry, State?S.log),
     %% reply with prepare_ok
     prepare_ok(Primary, View, Op, Msg#msg.epoch),
     %% reset primary failure timeout
-    Timeout = vrrm:config(primary_failure_interval),
-    {noreply, State?S{op = Op}, Timeout};
+    {noreply, State?S{op = Op}, replica_timeout()};
 handle_cast(#msg{payload = #prepare_ok{op = Op}},
             ?S{commit = Commit} = State)
   when Commit > Op ->
@@ -349,7 +360,14 @@ handle_cast(#msg{payload = #prepare_ok{op = Op} = Msg},
             CliRec = get_client(Client, Table),
             ReqRec = get_request(CliRec, Op, View),
             lager:info("cr = ~p req = ~p", [CliRec, ReqRec]),
-            gen_server:reply(ReqRec#request.from, {ok, Reply}),
+            case ReqRec#request.from of
+                undefined ->
+                    %% from isn't portable between nodes?? client will
+                    %% need to retry
+                    ok;
+                From ->
+                    gen_server:reply(From, {ok, Reply})
+            end,
             _ = add_reply(Client, ReqRec#request.req_num, Reply, Table),
             Pending1 = clean_pend(prepare_ok, Op, View, Pending),
             %% do we need to check if commit == Op - 1?
@@ -368,40 +386,27 @@ handle_cast(#msg{payload=#commit{commit = Commit}},
     %% needed.
     State = maybe_catchup(Commit, State0),
     %% reset primary failure timeout, which should be configurable
-    Timeout = vrrm:config(primary_failure_interval),
-    {noreply, State, Timeout};
-handle_cast(#msg{payload=#start_view_change{} = Msg, view=View, epoch=Epoch},
-            ?S{op = Op, view = OldView, pending_replies = Pending,
+    {noreply, State, replica_timeout()};
+handle_cast(#msg{payload=#start_view_change{}, view=View, epoch=Epoch},
+            ?S{op = Op, view = OldView,
                config = Config, log = Log0, status = Status,
                commit = Commit} = State) ->
-    %% have we recieved f view change messages? if no store and wait
-    F = f(State?S.config),
-    OKs = scan_pend(start_view_change, Op, View, Pending),
-    lager:info("~p start_view_change: ~p, ~p N ~p F ~p",
-               [self(), Msg, Pending, OKs, F]),
-    case length(OKs ++ [Msg]) of
-        N when N >= F ->
-            %% if yes, send a do_view_change message to the new primary
-            [Primary | _] = Config,
-            Log = ship_log(Log0),
-            do_view_change(Primary, View, Log, OldView, Op,
-                           Commit, Epoch),
-            %% change status to view_change if not already there, and note last_normal
-            {Status1, LastNormal1} =
-                case Status of
-                    normal ->
-                        {view_change, OldView};
-                    _ ->
-                        {Status, State?S.last_normal}
-                end,
-            Pending1 = clean_pend(start_view_change, Op, View, Pending),
-            {noreply, State?S{status = Status1, last_normal = LastNormal1,
-                              pending_replies = Pending1}};
-        _ ->
-            %% wait for more
-            Pending1 = [Msg | Pending],
-            {noreply, State?S{pending_replies = Pending1}}
-    end;
+    lager:info("~p start_view_change: ~p", [self(), View]),
+    %% calculate new primary here
+    {Primary, Config1} = fail_primary(Config),
+    Log = ship_log(Log0),
+    do_view_change(Primary, View, Log, OldView, Op, Commit, Epoch),
+    %% change status to view_change if not already there, and note last_normal
+    {Status1, LastNormal1} =
+        case Status of
+            normal ->
+                {view_change, OldView};
+            _ ->
+                {Status, State?S.last_normal}
+        end,
+    %% reset interval change to avoid storm?
+    {noreply, State?S{status = Status1, last_normal = LastNormal1,
+                      config = Config1}, replica_timeout()};
 handle_cast(#msg{payload = #do_view_change{view = View} = Msg},
             ?S{pending_replies = Pending, epoch = Epoch,
                log = Log, config = Config, commit = Commit} = State) ->
@@ -409,7 +414,7 @@ handle_cast(#msg{payload = #do_view_change{view = View} = Msg},
     F = f(State?S.config),
     OKs0 = scan_pend(do_view_change, ignore, View, Pending),
     lager:info("~p do_view_change: ~p, ~p N ~p F ~p",
-               [self(), Msg, Pending, OKs0, F + 1]),
+               [self(), Msg, length(Pending), length(OKs0) + 1, F + 1]),
     OKs = [Msg | Pending],
     HasSelf = has_self(OKs, self()),
     case length(OKs) of
@@ -419,15 +424,16 @@ handle_cast(#msg{payload = #do_view_change{view = View} = Msg},
             %% largest op_num.  set commit number to largest number in the
             %% result set, return status to normal, and send start_view to all
             %% other replicas (maybe compacting log first)
+            lager:info("OKs: ~p", [OKs]),
             HighestOp = get_highest_op(OKs),
             HighOp = HighestOp#do_view_change.op,
             HighLog = HighestOp#do_view_change.log,
             _ = sync_log(Commit, Log, HighOp, HighLog),
             HighCommit = get_highest_commit(OKs),
             [start_view(Replica, View, HighLog, HighOp, HighCommit, Epoch)
-             || Replica <- Config],
+             || Replica <- Config, is_pid(Replica)],
             {noreply, State?S{status = normal, op = HighOp,
-                              commit = HighCommit}};
+                              primary = true, commit = HighCommit}};
                               %% next_state = NextState, mod_state = ModState}};
         _ ->
             Pending1 = [Msg | Pending],
@@ -437,17 +443,18 @@ handle_cast(#msg{payload=#start_view{view = View, log = Log, op = Op,
                                      commit = Commit},
                  epoch = Epoch},
             ?S{log = LocalLog, commit = LocalCommit,
-               config = [Primary|_], mod_state = ModState,
+               config = Config, mod_state = ModState,
                mod = Mod, next_state = NextState} = State) ->
     %% replace log with Log, set op_num to highest op in the log, set
     %% view_num to View, if there are uncommitted operations in the
     %% log, send prepare_ok messages to the primary for them, commit
     %% any known commited and update commit number.
+    Primary = find_primary(Config),
     Commits = sync_log(LocalCommit, LocalLog, Op, Log),
     {NextState1, ModState1} = do_upcalls(Mod, NextState, ModState, LocalLog,
                                          Commits),
     [prepare_ok(Primary, View, PrepOp, Epoch)
-     || PrepOp <- list:seq(Commit + 1, Op)],
+     || PrepOp <- lists:seq(Commit + 1, Op)],
     {noreply, State?S{op = Op, view = View, status = normal,
                       mod_state = ModState1, next_state = NextState1}};
 %% handle_cast({recovery, Sender, Nonce, Epoch},
@@ -492,6 +499,8 @@ handle_info(Msg, ?S{primary = false, view = View, epoch = Epoch} = State)
                                                 % failures here
     %% initiate the view change by incrementing the view number and
     %% sending a start_view change message to all reachable replicas.
+    lager:info("~p detected primary timeout, starting view change",
+               [self()]),
     [_|Config] = State?S.config,
     [start_view_change(R, View + 1, Epoch)
      || R <- Config],
@@ -543,11 +552,12 @@ in_requests(Request, Requests) ->
             false
     end.
 
-get_request(#client{requests = Requests} = _C, Op, View) ->
-    lager:info("get_request c ~p o ~p v ~p", [_C, Op, View]),
-    Req = [R || {_, #request{op = O, view = V} = R}
+get_request(#client{requests = Requests} = _C, Op, _View) ->
+    lager:info("~p get_request c ~p o ~p v ~p",
+               [self(), _C, Op, _View]),
+    Req = [R || {_, #request{op = O} = R}
                     <- maps:to_list(Requests),
-                O == Op andalso V == View],
+                O == Op],
     case Req of
         [#request{} = RR] ->
             RR;
@@ -576,7 +586,7 @@ add_log_entry(Entry, Log) ->
     ets:insert(Log, Entry).
 
 get_log_entry(Op, Log) ->
-    lager:info("~p looking up log entry ~p", [self(), Op]),
+    lager:debug("~p looking up log entry ~p", [self(), Op]),
     case ets:lookup(Log, Op) of
         [OpRecord] ->
             OpRecord;
@@ -619,9 +629,17 @@ f(Config) ->
 
 %% manually unroll this because the compiler is not smart
 scan_pend(prepare_ok, Op, View, Pending) ->
-    lager:info("scan ~p ~p ~p", [Op, View, Pending]),
+    lager:debug("scan ~p ~p ~p", [Op, View, Pending]),
     [R || #prepare_ok{view = V, op = O} = R <- Pending,
           O == Op andalso V == View];
+scan_pend(start_view_change, _Op, View, Pending) ->
+    lager:debug("scan ~p ~p", [View, Pending]),
+    [R || #start_view_change{view = V} = R <- Pending,
+          V == View];
+scan_pend(do_view_change, _Op, View, Pending) ->
+    lager:debug("scan ~p ~p", [View, Pending]),
+    [R || #do_view_change{view = V} = R <- Pending,
+          V == View];
 scan_pend(_Msg, _Op, _View, _Pending) ->
     error(unimplemented).
 
@@ -641,38 +659,42 @@ add_snapshot(Snap, Op, Log) ->
 
 update_log_commit_state(Op, Log) ->
     [Operation] = ets:lookup(Log, Op),
-    lager:info("setting ~p ~p to committed", [Op, Operation]),
+    lager:debug("setting ~p ~p to committed", [Op, Operation]),
     ets:insert(Log, Operation#operation{committed = true}),
-    lager:info("wtf ~p", [ets:foldr(fun(X, Acc) -> [X|Acc] end, [], Log)]),
+    %% lager:debug("wtf ~p", [ets:foldr(fun(X, Acc) -> [X|Acc] end, [], Log)]),
     Interval = vrrm:config(snapshot_op_interval),
     maybe_compact(Op, Interval, Log).
 
 ship_log(Log) ->
     ets:foldl(fun(X, Acc) -> [X|Acc] end, [], Log).
 
-sync_log(OldCommit, OldLog, NewOp, NewLog) ->
+sync_log(OldCommit, OldLog, NewOpNum, NewLog) ->
     %% get a list of ops
     Ops0 =
         [case ets:lookup(OldLog, Op) of
              %% we've never heard of this one, insert
              [] ->
-                 NewOp = orddict:find(Op, NewLog),
+                 NewOp = lists:keyfind(Op, 2, NewLog),
                  ets:insert(OldLog, NewOp),
                  %% return the op because we need to commit it
                  %% may need to tag
                  Op;
-             [{_, #operation{committed = true} = OldOp}] ->
-                 NewOp = orddict:find(Op, NewLog),
+             [#operation{committed = true} = OldOp] ->
+                 NewOp = lists:keyfind(Op, 2, NewLog),
                  %% assert that ops are the same for safety
-                 NewOp = OldOp,
+                 NewCmd = NewOp#operation.command,
+                 OldCmd = OldOp#operation.command,
+                 NewCmd = OldCmd,
                  [];
-             [{_, _}]->
-                 NewOp = orddict:find(Op, NewLog),
+             [#operation{} = OldOp]->
+                 NewOp = lists:keyfind(Op, 2, NewLog),
                  %% assert that commands are the same for safety
-                 %% (NewOp#operation.command) = (OldOp#operation.command),
+                 NewCmd = NewOp#operation.command,
+                 OldCmd = OldOp#operation.command,
+                 NewCmd = OldCmd,
                  Op
          end
-         || Op <- lists:seq(OldCommit + 1, NewOp)],
+         || Op <- lists:seq(OldCommit + 1, NewOpNum)],
     lists:flatten(Ops0).
 
 maybe_compact(Op, Interval, _Log) when Op rem Interval /= 0 ->
@@ -714,3 +736,31 @@ has_self([_|T], Self) ->
     has_self(T, Self);
 has_self([], _) ->
     false.
+
+fail_primary(Config) ->
+    fail_primary(Config, first, []).
+
+fail_primary([], _, Acc) ->
+    Config = lists:reverse(Acc),
+    {find_primary(Config), Config};
+fail_primary([{failed, _} = H|T], first, Acc) ->
+    fail_primary(T, first, [H|Acc]);
+fail_primary([H|T], first, Acc) ->
+    fail_primary(T, rest, [{failed, H}|Acc]);
+fail_primary([H|T], rest, Acc) ->
+    fail_primary(T, rest, [H|Acc]).
+
+find_primary([{failed, _}|T]) ->
+    find_primary(T);
+find_primary([H|_]) ->
+    H.
+
+primary_timeout() ->
+    vrrm:config(idle_commit_interval).
+
+replica_timeout() ->
+    jitter(20, vrrm:config(primary_failure_interval)).
+
+jitter(Pct, Num) ->
+    M = 100 + (random:uniform(Pct * 2) - Pct),
+    (M * Num) div 100.
