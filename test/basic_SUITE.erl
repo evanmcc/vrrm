@@ -49,7 +49,7 @@ blackboard(Config) ->
                                          [], true, #{}),
              R
          end
-         || _ <- lists:seq(1, 5)],
+         || _ <- lists:seq(1, 3)],
 
     Replicas = lists:sort(Replicas0),
     [vrrm_replica:initial_config(R, Replicas)
@@ -81,12 +81,14 @@ blackboard(Config) ->
 
     [Primary2|_] = Rest,
     {ok, ok} = vrrm_replica:request(Primary2, {put, baz, quux}, 4),
+
+    %% allow the primary to recover
     sys:resume(Primary),
 
+    %% this bad request takes the place of a sleep.
     {error, timeout} = vrrm_replica:request(Primary, {get, baz}, 5),
     {ok, quux} = vrrm_replica:request(Primary, {get, baz}, 5),
 
-    %% allow the primary to recover
     [begin
          S = sys:get_status(R),
          lager:debug("state ~p", [S])

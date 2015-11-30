@@ -27,8 +27,8 @@
          start_view_change/3,
          do_view_change/7,
 
-         %% recovery/2,
-         %% recovery_response/2,
+         recovery/4,
+         recovery_response/7,
 
          %% reconfiguration/2,
          %% start_epoch/2,
@@ -38,7 +38,9 @@
          %% get_state/2,
          %% get_op/2, get_op/3,
          request/3, request/4,
-         initial_config/2
+         initial_config/2 %%,
+         %% reconfigure/2,
+         %% swap_node/2
         ]).
 
 -callback init(Args::[term()]) ->
@@ -448,7 +450,7 @@ handle_cast(#msg{payload = #do_view_change{view = View} = Msg},
     OKs0 = scan_pend(do_view_change, ignore, View, Pending),
     lager:info("~p do_view_change: ~p N ~p F ~p",
                [self(), length(Pending), length(OKs0) + 1, F + 1]),
-    OKs = [Msg | Pending],
+    OKs = [Msg | OKs0],
     HasSelf = has_self(OKs, self()),
     case length(OKs) of
         N when N >= F + 1 andalso HasSelf ->
@@ -501,20 +503,24 @@ handle_cast(#msg{payload=out_of_date, view = View, epoch = Epoch},
     {noreply, State?S{view = View, epoch = Epoch,
                       status = recovering, nonce = Nonce}};
 handle_cast(#msg{payload=#recovery{nonce = Nonce}, sender = Sender},
-            ?S{primary = false, view = View, epoch = Epoch} = State) ->
+            ?S{primary = false, view = View, epoch = Epoch,
+               config = Config} = State) ->
     %% if status is normal, send recovery_response
     lager:info("~p recovery, non-primary", [self()]),
+    Config1 = unfail_replica(Sender, Config),
     recovery_response(Sender, View, Nonce, undefined,
                       undefined, undefined, Epoch),
-    {noreply, State};
+    {noreply, State?S{config = Config1}};
 handle_cast(#msg{payload=#recovery{nonce = Nonce}, sender = Sender},
             ?S{primary = true, view = View, log = Log0,
-               op = Op, commit = Commit, epoch = Epoch} = State) ->
+               op = Op, commit = Commit, epoch = Epoch,
+               config = Config} = State) ->
     %% if primary, include additional information
     lager:info("~p recovery, primary", [self()]),
+    Config1 = unfail_replica(Sender, Config),
     Log = ship_log(Log0),
     recovery_response(Sender, View, Nonce, Log, Op, Commit, Epoch),
-    {noreply, State};
+    {noreply, State?S{config = Config1}};
 handle_cast(#msg{payload=#recovery_response{nonce = Nonce} = Msg,
                  view = View, sender = Sender, epoch = Epoch},
             ?S{log = LocalLog, commit = LocalCommit, mod = Mod,
@@ -721,13 +727,13 @@ scan_pend(prepare_ok, Op, View, Pending) ->
     [R || #prepare_ok{view = V, op = O} = R <- Pending,
           O == Op andalso V == View];
 scan_pend(do_view_change, _Op, View, Pending) ->
-    lager:debug("scan ~p ~p", [View, Pending]),
+    lager:info("scan ~p ~p", [View, Pending]),
     [R || #do_view_change{view = V} = R <- Pending,
           V == View];
 scan_pend(recovery_response, Nonce, _, Pending) ->
     lager:info("scan ~p ~p", [Nonce, Pending]),
     [R || #recovery_response{nonce = N} = R <- Pending,
-          N =/= Nonce];
+          N =:= Nonce];
 scan_pend(_Msg, _Op, _View, _Pending) ->
     error(unimplemented).
 
@@ -802,6 +808,7 @@ maybe_compact(_Op, _, _Log) ->
     ok.
 
 get_highest_op(Msgs) ->
+    lager:info("get highest ~p", [Msgs]),
     get_highest_op(Msgs, 0, undefined).
 
 get_highest_op([], _HighOp, HighMsg) ->
@@ -854,6 +861,16 @@ fail_primary([H|T], first, Acc) ->
     fail_primary(T, rest, [{failed, H}|Acc]);
 fail_primary([H|T], rest, Acc) ->
     fail_primary(T, rest, [H|Acc]).
+
+unfail_replica(Replica, Config) ->
+    unfail_replica(Replica, Config, []).
+
+unfail_replica(_Replica, [], Acc) ->
+    lists:reverse(Acc);
+unfail_replica(Replica, [{failed, Replica}|T], Acc) ->
+    unfail_replica(Replica, T, [Replica|Acc]);
+unfail_replica(Replica, [H|T], Acc) ->
+    unfail_replica(Replica, T, [H|Acc]).
 
 find_primary([{failed, _}|T]) ->
     find_primary(T);
