@@ -432,12 +432,15 @@ handle_cast(#msg{view = View, epoch = Epoch, sender = Sender,
     %% ignore these, as they're invalid under the current protocol,
     lager:info("~p discarding message from ~p with old view or epoch: ~p",
                [self(), Sender, Msg]),
+    %% this is a horrible thing to work around some potential races, I
+    %% need to figure out something better eventually.
     if is_record(Payload, do_view_change) andalso
        View =:= LocalView - 1 ->
             ok;
        is_record(Payload, prepare_ok) andalso
        Epoch =:= LocalEpoch - 1 ->
             ok;
+       %% otherwise we should let the other node know it's out of date.
        true ->
             out_of_date(Sender, LocalView, LocalEpoch)
     end,
@@ -507,17 +510,19 @@ handle_cast(#msg{payload = #prepare_ok{op = Op} = Msg},
                         Replica /= self()],
                     %% send a commit to the remaining nodes so we
                     %% don't have to wait for one
-                    [commit(Replica, Op, View, Epoch1)
+                    [commit(Replica, Op, 0, Epoch1)
                      || Replica <- Config -- NewNodes,
                         Replica /= self(),
                         is_pid(Replica)],
                     Reply = ok,
+                    View1 = 0,
                     NextState1 = NextState,
                     ModState1 = ModState;
                 _ ->
                     %% this needs to grow proper handling at some point
                     {reply, Reply, NextState1, ModState1} =
                         Mod:NextState(Command, ModState),
+                    View1 = View,
                     Epoch1 = Epoch
             end,
             update_log_commit_state(Op, Log),
@@ -535,7 +540,7 @@ handle_cast(#msg{payload = #prepare_ok{op = Op} = Msg},
             _ = add_reply(Client, ReqRec#request.req_num, Reply, Table),
             Pending1 = clean_pend(prepare_ok, {Op, View}, Pending),
             %% do we need to check if commit == Op - 1?
-            {noreply, State?S{commit = Op, epoch = Epoch1,
+            {noreply, State?S{commit = Op, epoch = Epoch1, view = View1,
                               mod_state = ModState1, next_state = NextState1,
                               pending_replies = Pending1}};
         _ ->
@@ -907,9 +912,10 @@ get_log_entry(Op, Log) ->
         _Huh -> error({noes, _Huh})
     end.
 
-maybe_transition(Commit, Epoch, ?S[]State) ->
-    State?S{epoch = Epoch},
-    oh boy.
+%% we're skipping the extra state here and will need to handle
+%% catching up later I guess
+maybe_transition(Commit, Epoch, State) ->
+    maybe_catchup(Commit, State?S{epoch = Epoch, view = 0}).
 
 maybe_catchup(Commit, ?S{commit = LocalCommit} = State)
   when LocalCommit >= Commit ->
