@@ -1,6 +1,26 @@
-#+TITLE: VRRM design
+#+TITLE: VRRM: just enough consensus
+* DISCLAIMER
+calling this research quality code is an insult to research quality
+code.
+
+this code almost certainly contains one or more horrifying
+linearizability bugs.
+* rationale
+a library designed for distributed systems that require concurrency,
+but in a fairly lightweight way (i.e. state is easy to recover or
+repair, FSMs have fairly regular checkpoints where log tails may be
+discarded).  It's currently unclear if this is actually a good idea!
+
+the tagline above, "just enough consensus" hints at what I am aiming
+for here.  rather than relying on an external service to provide
+linearizable consistency, we write a strongly consistent FSM for our
+service cluster which contains just the state we need to be
+linearized, and no more.  most services aim for industrial strength,
+this library aims in the opposite direction, to provide simple,
+lightweight, and naive consistency primitives for building right into
+your clustered applications.
 * structure
-- ha_supervisor:
+- ha_supervisor (currently unimplemented):
   - mostly just has the same supervisor API, maybe simplified a little
   - when the vrrm app is started, the supervisor tries to form an
     ensemble with all other supervisors (vrrm_ha_sup) on everything in
@@ -13,8 +33,6 @@
   - each is its own ensemble
   - degenerate state-keeping, on repair, just transfer the entire
     serialized state of the behavior implementation and most of our own.
-* rationale
-a library designed for distributed systems that require concurrency,
-but in a fairly lightweight way (i.e. state is easy to recover or
-repair, FSMs have fairly regular checkpoints where log tails may be
-discarded).  It's currently unclear if this is actually a good idea!
+* documentation
+right now there isn't any.  the blackboard test is perhaps the best
+example.  the library is expected to be in flux for quite some time.
