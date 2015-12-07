@@ -5,7 +5,9 @@
 %% behavior api
 -export([
          init/1,
-         terminate/2
+         terminate/2,
+         serialize/1,
+         deserialize/1
         ]).
 
 %% states
@@ -25,6 +27,13 @@ init(_) ->
 
 terminate(_Reason, _State) ->
     ok.
+
+%% no side effects here
+serialize(State) ->
+    State.
+
+deserialize(State) ->
+    State.
 
 accepting({get, Key}, ?S{board = Board} = State) ->
     Reply =

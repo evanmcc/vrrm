@@ -68,6 +68,8 @@ blackboard(Config) ->
 
     {ok, bar} = vrrm_replica:request(Primary, {get, foo}, 2),
 
+    lager:info("suspending primary"),
+
     %% kill the primary
     sys:suspend(Primary),
     timer:sleep(1000), % lower the timeouts?
@@ -82,17 +84,49 @@ blackboard(Config) ->
     [Primary2|_] = Rest,
     {ok, ok} = vrrm_replica:request(Primary2, {put, baz, quux}, 4),
 
+    lager:info("resuming primary"),
     %% allow the primary to recover
     sys:resume(Primary),
 
-    %% this bad request takes the place of a sleep.
+    lager:info("validating primary recovery"),
+    %% this is bad(?), request takes the place of a sleep.
     {error, timeout} = vrrm_replica:request(Primary, {get, baz}, 5),
     {ok, quux} = vrrm_replica:request(Primary, {get, baz}, 5),
 
-    [begin
-         S = sys:get_status(R),
-         lager:debug("state ~p", [S])
-     end
-     || R <- Replicas],
+    %% make two new nodes and join them to the cluster
+    NewNodes =
+        [begin
+             {ok, R} =
+                 vrrm_replica:start_link(vrrm_blackboard,
+                                         [], true, #{}),
+             R
+         end
+         || _ <- lists:seq(1, 3)],
+    %% add three new nodes, with the primary exiting and leaving
+    NewConfig0 = (Replicas ++ NewNodes) -- [Primary],
+    NewConfig = lists:sort(NewConfig0),
+    [NewPrimary|_] = NewConfig,
+    lager:info("starting reconfigure"),
+    {ok, ok} = vrrm_replica:reconfigure(Primary, NewConfig, 6),
+
+    timer:sleep(200),
+
+    ModState0 =
+        [begin
+             S = vrrm_replica:get_mod_state(R),
+             lager:debug("state ~p", [S]),
+             S
+         end
+         || R <- NewConfig],
+    ModState = lists:usort(ModState0),
+    lager:info("modstate ~p", [ModState]),
+    1 = length(ModState),
+
+    {ok, bar} = vrrm_replica:request(NewPrimary, {get, foo}, 7),
+
+    {ok, ok} = vrrm_replica:request(NewPrimary, {put, foo, blort}, 8),
+    {ok, blort} = vrrm_replica:request(NewPrimary, {get, foo}, 9),
+
+    false = is_process_alive(Primary),
 
     Config.
