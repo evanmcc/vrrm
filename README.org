@@ -36,3 +36,11 @@ your clustered applications.
 * documentation
 right now there isn't any.  the blackboard test is perhaps the best
 example.  the library is expected to be in flux for quite some time.
+* why not paxos or raft?
+the language and descriptions in the paper, while not perfect, are
+clearer and more implementation-oriented than either (most of) the
+Paxos papers or the Raft paper.  Paxos is notoriously complicated to
+implement correctly, and Raft has few things to recommend it over
+VR(R) in terms of the separation of various parts of the protocol.
+* resources
+- the paper: http://pmg.csail.mit.edu/papers/vr-revisited.pdf

@@ -8,7 +8,7 @@
     - [ ] usage documentation
     - [ ] full supervisor compatibility
   - [ ] deduplicate core replication logic
-  - [ ] fancier log implementations
+  - [ ] fancier/pluggable log implementations
   - [ ] refactor core logic into and FSM
   - [X] basic log compaction
   - [ ] checkpoint state to disk
