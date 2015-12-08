@@ -1,7 +1,8 @@
-- [0/8] 0.2.0
-  - [ ] write vrrm_cli [0/2]
+- [1/11] 0.2.0
+  - [ ] write vrrm_cli [0/3]
     - [ ] basic client
     - [ ] reconfiguration handling
+    - [ ] rework testing to use the client
   - [ ] write ha sup [0/3]
     - [ ] basic sup
     - [ ] usage documentation
@@ -9,6 +10,13 @@
   - [ ] deduplicate core replication logic
   - [ ] fancier log implementations
   - [ ] refactor core logic into and FSM
-  - [ ] basic log compaction
+  - [X] basic log compaction
   - [ ] checkpoint state to disk
   - [ ] resumable clusters
+  - [ ] GC old client requests
+  - [ ] more basic FSMs
+    - [ ] CAS register
+    - [ ] set
+    - [ ] counter
+    - [ ] spinlock?
+  - [ ] consider composable behaviors?

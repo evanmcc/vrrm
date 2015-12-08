@@ -11,7 +11,7 @@ init_per_suite(Config) ->
     application:set_env(vrrm, idle_commit_interval, 250),
     application:set_env(vrrm, primary_failure_interval, 400),
 
-    lager_common_test_backend:bounce(warning),
+    lager_common_test_backend:bounce(info),
     Config.
 
 end_per_suite(_Config) ->
