@@ -60,6 +60,12 @@
 -callback deserialize(SerializedState::term()) ->
     ok | {error, Reason::term()}.
 
+%% when we add leases, we want to be able to do no_transition
+%% operations from the primary without having to consult the replicas
+%% while the lease is valid.  the canoncial example here is reads in a
+%% kv store. this optional callback will give a list of these states.
+%% -callback no_transition() -> [atom()].
+
 -callback terminate(Reason::term(), State::term()) ->
     ok.
 
@@ -86,6 +92,7 @@
 -record(operation,
         {
           num :: non_neg_integer(),
+          req_num :: non_neg_integer(),
           view :: non_neg_integer(),
           command :: term(),
           %% not sure that we need this, but also not sure how we
@@ -129,10 +136,7 @@
                          private]) :: ets:tid(),
           op =  0 :: non_neg_integer(),
           commit = 0 :: non_neg_integer(),
-          client_table = ets:new(table,
-                                 [set,
-                                  {keypos, 2},
-                                  private]) :: ets:tid(),
+          client_table = #{} :: #{pid() => client()},
           epoch = 0 :: non_neg_integer(),
           old_config :: [atom()],
 
@@ -334,6 +338,7 @@ handle_call({request, Command, Client, Request},
             Op1 = Op + 1,
             ClientRecord = get_client(Client, Table),
             Entry = #operation{num = Op1,
+                               req_num = Request,
                                view = View,
                                command = Command,
                                client = Client},
@@ -342,11 +347,12 @@ handle_call({request, Command, Client, Request},
                                      view = View,
                                      req_num = Request,
                                      from = From},
-            _ = add_request(ClientRecord, RequestRecord, Table),
+            Table1 = add_request(Client, ClientRecord, RequestRecord, Table),
             [prepare(Replica, View, Command, Client, Request,
                      Op1, Commit, Epoch)
              || Replica <- Config, Replica /= self(), is_pid(Replica)],
             {noreply, State?S{op = Op1,
+                              client_table = Table1,
                               timeout = primary_timeout(Timeout)}}
     end;
 handle_call({initial_config, Config}, _From, State) ->
@@ -397,17 +403,19 @@ handle_call({reconfigure, NewConfig, Client, Request}, From,
             Entry = #operation{num = Op1,
                                view = View,
                                command = {'$reconfigure', NewConfig},
+                               req_num = Request,
                                client = Client},
             _ = add_log_entry(Entry, Log),
             RequestRecord = #request{op = Op1,
                                      view = View,
                                      req_num = Request,
                                      from = From},
-            _ = add_request(ClientRecord, RequestRecord, Table),
+            Table1 = add_request(Client, ClientRecord, RequestRecord, Table),
             [prepare(Replica, View, {'$reconfigure', NewConfig}, Client,
                      Request, Op1, Commit, Epoch)
              || Replica <- Config, Replica /= self(), is_pid(Replica)],
             {noreply, State?S{op = Op1, status = transitioning,
+                              client_table = Table1,
                               timeout = primary_timeout(Timeout)}}
     end;
 handle_call(get_mod_state, _From,
@@ -465,17 +473,19 @@ handle_cast(#msg{payload = #prepare{primary = Primary, command = Command,
     RequestRecord = #request{op = Op,
                              view = View,
                              req_num = Request},
-    _ = add_request(ClientRecord, RequestRecord, Table),
+    Table1 = add_request(Client, ClientRecord, RequestRecord, Table),
     %% increment op number, append operation to log, update client table(?)
     Entry = #operation{num = Op,
                        client = Client,
                        view = View,
-                       command = Command},
+                       command = Command,
+                       req_num = Request},
     _ = add_log_entry(Entry, State?S.log),
     %% reply with prepare_ok
     prepare_ok(Primary, View, Op, Msg#msg.epoch),
     %% reset primary failure timeout
     {noreply, State?S{op = Op,
+                      client_table = Table1,
                       timeout = replica_timeout(Timeout)}};
 handle_cast(#msg{payload = #prepare_ok{op = Op}},
             ?S{commit = Commit} = State)
@@ -497,7 +507,9 @@ handle_cast(#msg{payload = #prepare_ok{op = Op} = Msg},
             lager:debug("got enough, replying"),
             %% update commit_num to OpNum, do Mod upcall, send {reply,
             %% v, s, x} set commit message timeout.
-            #operation{command = Command, client = Client} =
+            #operation{command = Command,
+                       req_num = Request,
+                       client = Client} =
                          get_log_entry(Op, Log),
             case Command of
                 {'$reconfigure', NewConfig} ->
@@ -525,9 +537,11 @@ handle_cast(#msg{payload = #prepare_ok{op = Op} = Msg},
                     View1 = View,
                     Epoch1 = Epoch
             end,
-            update_log_commit_state(Op, Log),
+            _ = update_log_commit_state(Op, Log),
+            Interval = vrrm:config(snapshot_op_interval),
+            _ = maybe_compact(Op, Interval, {NextState1, ModState1}, Log),
             CliRec = get_client(Client, Table),
-            ReqRec = get_request(CliRec, Op, View),
+            ReqRec = get_request(CliRec, Request),
             lager:debug("cr = ~p req = ~p", [CliRec, ReqRec]),
             case ReqRec#request.from of
                 undefined ->
@@ -839,15 +853,15 @@ code_change(_OldVsn, State, _Extra) ->
 %%%===================================================================
 
 get_client(Pid, Table) ->
-    case ets:lookup(Table, Pid) of
-        [Client] ->
+    case maps:find(Pid, Table) of
+        {ok, Client} ->
             Client;
         _ ->
             #client{address = Pid}
     end.
 
 recent(Client, Request, Table) ->
-    case ets:lookup(Table, Client) of
+    case maps:find(Client, Table) of
         [Record] ->
             in_requests(Request, Record#client.requests);
         _ ->
@@ -855,50 +869,44 @@ recent(Client, Request, Table) ->
     end.
 
 in_requests(Request, Requests) ->
-    Scan = [R || {_K, R} <- maps:to_list(Requests),
-                 R#request.req_num == Request],
-    case Scan of
-        [Record] ->
-            #request{op = Op,
-                     reply = Reply} = Record,
+    case maps:find(Request, Requests) of
+        {ok, #request{op = Op,
+                      reply = Reply}} ->
             case Op of
                 #operation{committed = true} ->
                     {true, Reply};
                 _ ->
                     false
             end;
-        [] ->
+        _ ->
             false
     end.
 
-get_request(#client{requests = Requests} = _C, Op, _View) ->
-    lager:debug("~p get_request c ~p o ~p v ~p",
-                [self(), _C, Op, _View]),
-    Req = [R || {_, #request{op = O} = R}
-                    <- maps:to_list(Requests),
-                O == Op],
-    case Req of
-        [#request{} = RR] ->
+get_request(#client{requests = Requests} = _C, Request) ->
+    lager:debug("~p get_request c ~p o ~p",
+                [self(), _C, Request]),
+    case maps:find(Request, Requests) of
+        {ok, #request{} = RR} ->
             RR;
         _E ->
             error({from, _E})
     end.
 
-add_request(#client{requests = Requests} = Client,
+add_request(Pid, #client{requests = Requests} = Client,
             #request{req_num = RequestNum} = Request, Table) ->
-    ets:insert(Table,
-               Client#client{requests = maps:put(RequestNum,
-                                                 Request,
-                                                 Requests)}).
+    maps:put(Pid, Client#client{requests = maps:put(RequestNum,
+                                                    Request,
+                                                    Requests)},
+             Table).
 
 add_reply(Client, RequestNum, Reply, Table) ->
-    [CR] = ets:lookup(Table, Client),
+    CR = maps:get(Client, Table),
     #client{requests = Requests} = CR,
     Request = maps:get(RequestNum, Requests),
     Requests1 = maps:put(RequestNum,
                          Request#request{reply = Reply},
                          Requests),
-    ets:insert(Table, CR#client{requests = Requests1}).
+    maps:put(Client, CR#client{requests = Requests1}, Table).
 
 add_log_entry(Entry, Log) ->
     lager:debug("adding log entry ~p", [Entry]),
@@ -1019,21 +1027,15 @@ get_snapshot(Log) ->
 update_log_commit_state(Op, Log) ->
     [Operation] = ets:lookup(Log, Op),
     lager:debug("setting ~p ~p to committed", [Op, Operation]),
-    ets:insert(Log, Operation#operation{committed = true}),
-    %% lager:debug("wtf ~p", [ets:foldr(fun(X, Acc) -> [X|Acc] end, [], Log)]),
-    Interval = vrrm:config(snapshot_op_interval),
-    maybe_compact(Op, Interval, Log).
+    ets:insert(Log, Operation#operation{committed = true}).
 
 ship_log(Log) ->
     ets:foldl(fun(X, Acc) -> [X|Acc] end, [], Log).
 
 trunc_uncommitted(Log, Commit) ->
-    case ets:lookup(Log, Commit) of
-        [_] ->
-            ets:delete(Log, Commit + 1);
-        [] ->
-            ok
-    end.
+    %% this is an operation, rather than the snapshot hack
+    ets:select_delete(Log, [{{'_','$1','_','_','_','_','_'},
+                             [],[{'>','$1',Commit}]}]).
 
 sync_log(OldCommit, OldLog, NewOpNum, NewLog) ->
     %% get a list of ops
@@ -1053,12 +1055,7 @@ sync_log(OldCommit, OldLog, NewOpNum, NewLog) ->
                  OldCmd = OldOp#operation.command,
                  NewCmd = OldCmd,
                  [];
-             [#operation{} = OldOp]->
-                 NewOp = lists:keyfind(Op, 2, NewLog),
-                 %% assert that commands are the same for safety
-                 NewCmd = NewOp#operation.command,
-                 OldCmd = OldOp#operation.command,
-                 NewCmd = OldCmd,
+             [#operation{}]->
                  Op
          end
          || Op <- lists:seq(OldCommit + 1, NewOpNum)],
@@ -1069,12 +1066,18 @@ install_log(Log, NewLog) ->
     _ = [ets:insert(Log, X) || X <- NewLog],
     ok.
 
-maybe_compact(Op, Interval, _Log) when Op rem Interval /= 0 ->
+maybe_compact(Op, Interval, _Snap, _Log) when Op rem Interval /= 0 ->
     ok;
-maybe_compact(_Op, _, _Log) ->
+maybe_compact(Op, _, Snap, Log) ->
     %% make current app state the snapshot
+    _ = add_snapshot(Op, Snap, Log),
     %% remove all log entries before Op
-    ok.
+    %%Sz1 = ets:info(Log, size),
+    ets:select_delete(Log, [{{'_', '$1', '_', '_', '_', '_', '_'},
+                             [],
+                             [{'=<','$1',Op}]}]).
+    %%Sz2 = ets:info(Log, size),
+    %%lager:warning("compacted log from ~p to ~p", [Sz1, Sz2]).
 
 get_highest_op(Msgs) ->
     lager:debug("get highest ~p", [Msgs]),

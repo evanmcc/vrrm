@@ -1,0 +1,14 @@
+- [0/8] 0.2.0
+  - [ ] write vrrm_cli [0/2]
+    - [ ] basic client
+    - [ ] reconfiguration handling
+  - [ ] write ha sup [0/3]
+    - [ ] basic sup
+    - [ ] usage documentation
+    - [ ] full supervisor compatibility
+  - [ ] deduplicate core replication logic
+  - [ ] fancier log implementations
+  - [ ] refactor core logic into and FSM
+  - [ ] basic log compaction
+  - [ ] checkpoint state to disk
+  - [ ] resumable clusters

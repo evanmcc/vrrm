@@ -20,7 +20,7 @@
     {primary_failure_interval, 4000}, % 4 seconds
     %% how many ops do we commit before we update the snapshot and
     %% compact the log
-    {snapshot_op_interval, 10}
+    {snapshot_op_interval, 100}
    ]},
   {modules, []}
  ]}.

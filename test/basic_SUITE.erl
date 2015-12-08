@@ -11,7 +11,7 @@ init_per_suite(Config) ->
     application:set_env(vrrm, idle_commit_interval, 250),
     application:set_env(vrrm, primary_failure_interval, 400),
 
-    lager_common_test_backend:bounce(info),
+    lager_common_test_backend:bounce(warning),
     Config.
 
 end_per_suite(_Config) ->
@@ -128,5 +128,29 @@ blackboard(Config) ->
     {ok, blort} = vrrm_replica:request(NewPrimary, {get, foo}, 9),
 
     false = is_process_alive(Primary),
+
+    %% eprof:start(),
+    %% eprof:start_profiling(NewConfig),
+
+    Ct = 100000,
+    Time =
+        timer:tc(fun() ->
+                         _ = [vrrm_replica:request(NewPrimary,
+                                                   {put, ctr, N},
+                                                   9 + N)
+                              || N <- lists:seq(1, Ct)]
+                 end),
+
+    {TimeNs, _} = Time,
+
+    TimeSec = TimeNs div 1000000,
+    {ok, Ct} = vrrm_replica:request(NewPrimary,
+                                    {get, ctr},
+                                    9 + Ct + 10),
+
+    lager:warning("Time ~p in ~p", [Ct, TimeSec]),
+
+    %% eprof:stop_profiling(),
+    %% eprof:analyze(total),
 
     Config.
