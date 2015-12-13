@@ -1,0 +1,6 @@
+-name ${NODE_NAME}
+
+-setcookie test_sup_cookie
+
++K true
++A30
