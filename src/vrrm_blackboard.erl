@@ -7,7 +7,8 @@
          init/1,
          terminate/2,
          serialize/1,
-         deserialize/1
+         deserialize/1,
+         handle_info/2
         ]).
 
 %% states
@@ -48,3 +49,6 @@ accepting({put, Key, Val}, ?S{board = Board} = State) ->
     Board1 = maps:put(Key, Val, Board),
     {reply, ok, accepting, State?S{board = Board1}}.
 
+
+handle_info(_, State) ->
+    {next_state, accepting, State}.
