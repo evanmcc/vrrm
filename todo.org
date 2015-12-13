@@ -1,11 +1,13 @@
-- [1/11] 0.2.0
+- [-] 0.2.0 [1/14]
   - [ ] write vrrm_cli [0/3]
     - [ ] basic client
     - [ ] reconfiguration handling
     - [ ] rework testing to use the client
-  - [ ] write ha sup [0/3]
+  - [ ] write ha sup [0/4]
+    - [ ] bootstrapping
     - [ ] basic sup
     - [ ] usage documentation
+      - [ ] guidelines on how to handle non-determinism
     - [ ] full supervisor compatibility
   - [ ] deduplicate core replication logic
   - [ ] fancier/pluggable log implementations
@@ -19,4 +21,12 @@
     - [ ] set
     - [ ] counter
     - [ ] spinlock?
+  - [ ] vrrm_replica behavior improvements
+    - [ ] actually use serialize and deserialize
+    - [ ] implement handle_info
+    - [ ] inch closer to full gen_fsm compatability
   - [ ] consider composable behaviors?
+  - [ ] request batching
+  - [ ] improve performance (? curr 3=20k/s, 5=15k/s local)
+- [ ] 0.3.0 [0/1]
+  - [ ] ???

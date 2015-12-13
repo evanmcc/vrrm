@@ -36,9 +36,11 @@
          %% %% sync
          request/3, request/4,
          initial_config/2,
+         get_config/1,
          reconfigure/3,
          get_mod_state/1,
-         state_transfer/1
+         state_transfer/1,
+         am_primary/1
          %% get_op/2, get_op/3,
          %% swap_node/2
         ]).
@@ -54,11 +56,15 @@
 %%     {reply, Reply, NextStateName, UpdModState} |
 %%     {stop, UpdModState}.
 
+-callback handle_info(Msg::term(), State::term()) ->
+    {next_state, NextState::atom(), State::term()} |
+    {stop, Reason::term(), State::term()}.
+
 -callback serialize(State::term()) ->
     {ok, SerializedState::term()} | {error, Reason::term()}.
 
 -callback deserialize(SerializedState::term()) ->
-    ok | {error, Reason::term()}.
+    {ok, DeserializedState::term()} | {error, Reason::term()}.
 
 %% when we add leases, we want to be able to do no_transition
 %% operations from the primary without having to consult the replicas
@@ -172,12 +178,15 @@ request(Primary, Command, Request, Timeout) ->
     try
         gen_server:call(Primary, {request, Command, self(), Request}, Timeout)
     catch C:E ->
-            lager:debug("req to ~p:~p", [C,E]),
+            lager:warning("request failed with: ~p:~p", [C,E]),
             {error, timeout}
     end.
 
 initial_config(Replica, Config) ->
     gen_server:call(Replica, {initial_config, Config}, infinity).
+
+get_config(Replica) ->
+    gen_server:call(Replica, get_config).
 
 reconfigure(Primary, NewConfig, Request) ->
     gen_server:call(Primary, {reconfigure, NewConfig, self(), Request},
@@ -185,6 +194,9 @@ reconfigure(Primary, NewConfig, Request) ->
 
 get_mod_state(Replica) ->
     gen_server:call(Replica, get_mod_state).
+
+am_primary(Replica) ->
+    gen_server:call(Replica, am_primary).
 
 -record(st, {view :: non_neg_integer(),
              commit :: non_neg_integer(),
@@ -300,7 +312,8 @@ init([Mod, ModArgs, New, _Opts]) ->
                    next_state = NextState,
                    mod_state = ModState
                   },
-            add_snapshot({NextState, ModState}, 0, State?S.log),
+            add_snapshot({NextState, Mod:serialize(ModState)},
+                         0, State?S.log),
             {ok, State};
         false ->
             %% here we need to create a node without any
@@ -312,8 +325,9 @@ init([Mod, ModArgs, New, _Opts]) ->
 %% request
 handle_call({request, _Command, _Client, _Request},
             _From,
-            ?S{primary = false} = State) ->
-    {reply, not_primary, State};
+            ?S{primary = false, config = Config} = State) ->
+    Primary = find_primary(Config),
+    {reply, {error, not_primary, Primary}, State};
 handle_call({request, _Command, _Client, _Request},
             _From,
             ?S{primary = true, status = transitioning} = State) ->
@@ -364,18 +378,28 @@ handle_call({initial_config, Config}, _From, State) ->
     Timeout =
         case AmPrimary of
             true ->
+                %% trigger initial view change
+                [start_view_change(R, 1, 0)
+                 || R <- Config],
                 %% haxx
                 primary_timeout(make_ref());
             false ->
+                %% haxx
                 replica_timeout(make_ref())
         end,
     {reply, ok, State?S{config = Config,
                         status = normal,
                         primary = AmPrimary,
                         timeout = Timeout}};
+handle_call(get_config, _From, ?S{primary = false, config = Config} = State) ->
+    Primary = find_primary(Config),
+    {reply, {error, not_primary, Primary}, State};
+handle_call(get_config, _From, ?S{config = Config} = State) ->
+    {reply, Config, State};
 handle_call({reconfigure, _NewConfig, _Client, _Request}, _From,
-            ?S{primary = false} = State) ->
-    {reply, not_primary, State};
+            ?S{primary = false, config = Config} = State) ->
+    Primary = find_primary(Config),
+    {reply, {error, not_primary, Primary}, State};
 handle_call({reconfigure, NewConfig, Client, Request}, From,
             ?S{config = Config, primary = true, status = normal,
                log = Log, client_table = Table, view = View,
@@ -428,6 +452,8 @@ handle_call(state_transfer, _From,
              commit = Commit,
              view = View},
     {reply, {ok, ST}, State};
+handle_call(am_primary, _From, ?S{primary = Primary} = State) ->
+    {reply, Primary, State};
 handle_call(_Request, _From, State) ->
     lager:warning("~p unexpected call ~p from ~p~n ~p",
                   [self(), _Request, _From, State]),
@@ -539,7 +565,7 @@ handle_cast(#msg{payload = #prepare_ok{op = Op} = Msg},
             end,
             _ = update_log_commit_state(Op, Log),
             Interval = vrrm:config(snapshot_op_interval),
-            _ = maybe_compact(Op, Interval, {NextState1, ModState1}, Log),
+            _ = maybe_compact(Op, Interval, Mod, {NextState1, ModState1}, Log),
             CliRec = get_client(Client, Table),
             ReqRec = get_request(CliRec, Request),
             lager:debug("cr = ~p req = ~p", [CliRec, ReqRec]),
@@ -549,7 +575,7 @@ handle_cast(#msg{payload = #prepare_ok{op = Op} = Msg},
                     %% need to retry
                     ok;
                 From ->
-                    gen_server:reply(From, {ok, Reply})
+                    gen_server:reply(From, {ok, Reply, Epoch})
             end,
             _ = add_reply(Client, ReqRec#request.req_num, Reply, Table),
             Pending1 = clean_pend(prepare_ok, {Op, View}, Pending),
@@ -595,7 +621,8 @@ handle_cast(#msg{payload=#start_view_change{}, view=View, epoch=Epoch,
                  fail_primary(Config)
         end,
     Log = ship_log(Log0),
-    lager:debug("~p sending do view change to ~p", [self(), Primary]),
+    lager:info("~p sending do view change ~p -> ~p to ~p",
+               [self(), OldView, View, Primary]),
     do_view_change(Primary, View, Log, OldView, Op, Commit, Epoch),
     %% change status to view_change if not already there, and note last_normal
     {Status1, LastNormal1} =
@@ -619,7 +646,7 @@ handle_cast(#msg{payload = #do_view_change{view = View} = Msg},
     %% have we gotten f + 1 (inclusive of self)? if no, wait
     F = f(State?S.config),
     OKs0 = scan_pend(do_view_change, View, Pending),
-    lager:debug("~p do_view_change: ~p N ~p F ~p",
+    lager:info("~p do_view_change: ~p N ~p F ~p",
                 [self(), length(Pending), length(OKs0) + 1, F + 1]),
     OKs = [Msg | OKs0],
     HasSelf = has_self(OKs, self()),
@@ -630,7 +657,7 @@ handle_cast(#msg{payload = #do_view_change{view = View} = Msg},
             %% largest op_num.  set commit number to largest number in the
             %% result set, return status to normal, and send start_view to all
             %% other replicas (maybe compacting log first)
-            lager:debug("OKs: ~p", [OKs]),
+            lager:info("OKs: ~p", [OKs]),
             HighestOp = get_highest_op(OKs),
             HighOp = HighestOp#do_view_change.op,
             HighLog = HighestOp#do_view_change.log,
@@ -773,8 +800,9 @@ handle_cast(#msg{payload=#start_epoch{op = Op, old_config = OldConfig,
     {ok, ST } = state_transfer(Source),
     lager:debug("~p got transfer ~p from ~p", [self(), ST, Source]),
     _ = install_log(Log, ST#st.log),
-    {SnapOp, {NextState, ModState}} =
+    {SnapOp, {NextState, ModState0}} =
         get_snapshot(Log),
+    ModState = Mod:deserialize(ModState0),
     case SnapOp of
         Op ->
             ModState1 = ModState,
@@ -836,11 +864,19 @@ handle_info(primary_timeout,
     [_|Config] = State?S.config,
     [start_view_change(R, View + 1, Epoch)
      || R <- Config, is_pid(R)],
-    {noreply, State?S{view = View + 1,
+    {noreply, State?S{view = View,
                       timeout = replica_timeout(Timeout)}};
-handle_info(_Info, State) ->
-    lager:warning("unexpected message ~p", [_Info]),
-    {noreply, State}.
+handle_info(Msg, ?S{mod = Mod, mod_state = ModState} = State) ->
+    try Mod:handle_info(Msg, ModState) of
+        {next_state, NextState1, ModState1} ->
+            {noreply, State?S{next_state = NextState1,
+                              mod_state = ModState1}};
+        {stop, Reason, ModState1} ->
+            {stop, Reason, State?S{mod_state = ModState1}}
+    catch error:function_clause ->
+            lager:warning("~p unexpected message ~p", [self(), Msg]),
+            {noreply, State}
+    end.
 
 terminate(_Reason, _State) ->
     ok.
@@ -1066,9 +1102,10 @@ install_log(Log, NewLog) ->
     _ = [ets:insert(Log, X) || X <- NewLog],
     ok.
 
-maybe_compact(Op, Interval, _Snap, _Log) when Op rem Interval /= 0 ->
+maybe_compact(Op, Interval, _Mod, _Snap, _Log) when Op rem Interval /= 0 ->
     ok;
-maybe_compact(Op, _, Snap, Log) ->
+maybe_compact(Op, _, Mod, {NS, MS0}, Log) ->
+    Snap = {NS, Mod:serialize(MS0)},
     %% make current app state the snapshot
     _ = add_snapshot(Op, Snap, Log),
     %% remove all log entries before Op
@@ -1083,7 +1120,7 @@ get_highest_op(Msgs) ->
 get_highest_op([], _HighOp, HighMsg) ->
     HighMsg;
 get_highest_op([H|T], HighOp, HighMsg) ->
-    case H#do_view_change.op > HighOp of
+    case H#do_view_change.op >= HighOp of
         true ->
             get_highest_op(T, H#do_view_change.op, H);
         _ ->
@@ -1127,7 +1164,7 @@ fail_primary([], _, Acc) ->
 fail_primary([{failed, _} = H|T], first, Acc) ->
     fail_primary(T, first, [H|Acc]);
 fail_primary([H|T], first, Acc) ->
-    lager:debug("~p marking ~p failed", [self(), H]),
+    lager:info("~p marking ~p failed", [self(), H]),
     fail_primary(T, rest, [{failed, H}|Acc]);
 fail_primary([H|T], rest, Acc) ->
     fail_primary(T, rest, [H|Acc]).

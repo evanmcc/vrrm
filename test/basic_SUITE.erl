@@ -52,8 +52,10 @@ blackboard(Config) ->
          || _ <- lists:seq(1, 3)],
 
     Replicas = lists:sort(Replicas0),
+    %% have to reverse because of initial view change and synchrony
+    %% problems, need a better solution later for initial vier stuff
     [vrrm_replica:initial_config(R, Replicas)
-     || R <- Replicas],
+     || R <- lists:reverse(Replicas)],
 
     [Primary|Rest] = Replicas,
     lager:info("replicas: ~p primary; ~p", [Replicas, Primary]),
@@ -61,12 +63,12 @@ blackboard(Config) ->
     %% need to abstract some of this away in a client module
 
     %% set initial state
-    {ok, ok} = vrrm_replica:request(Primary, {put, foo, bar}, 1),
+    ok = vrrm_cli:request(Primary, {put, foo, bar}),
     %% test idempotency of requests
-    {ok, ok} = vrrm_replica:request(Primary, {put, foo, bar}, 1),
+    {ok, ok, 0} = vrrm_replica:request(Primary, {put, foo, bar}, 1),
     %% check here that op/commit are the same as before
 
-    {ok, bar} = vrrm_replica:request(Primary, {get, foo}, 2),
+    {ok, bar} = vrrm_cli:request(Primary, {get, foo}),
 
     lager:info("suspending primary"),
 
@@ -74,24 +76,22 @@ blackboard(Config) ->
     sys:suspend(Primary),
     timer:sleep(1000), % lower the timeouts?
 
-    %% make a request to all others and make sure that it works
-    Replies = [vrrm_replica:request(R, {get, foo}, 3)
-               || R <- Rest],
+    {ok, bar} = vrrm_cli:request(Primary, {get, foo}),
 
-    lager:info("replies: ~p", [Replies]),
+    %% lager:info("replies: ~p", [Replies]),
     %% compare all the module state to make sure that it matches
 
     [Primary2|_] = Rest,
-    {ok, ok} = vrrm_replica:request(Primary2, {put, baz, quux}, 4),
+    ok = vrrm_cli:request(Primary2, {put, baz, quux}),
 
     lager:info("resuming primary"),
     %% allow the primary to recover
     sys:resume(Primary),
 
     lager:info("validating primary recovery"),
-    %% this is bad(?), request takes the place of a sleep.
-    {error, timeout} = vrrm_replica:request(Primary, {get, baz}, 5),
-    {ok, quux} = vrrm_replica:request(Primary, {get, baz}, 5),
+
+    %% should validate here that this request takes $Timeout ms
+    {ok, quux} = vrrm_cli:request(Primary, {get, baz}),
 
     %% make two new nodes and join them to the cluster
     NewNodes =
@@ -107,7 +107,7 @@ blackboard(Config) ->
     NewConfig = lists:sort(NewConfig0),
     [NewPrimary|_] = NewConfig,
     lager:info("starting reconfigure"),
-    {ok, ok} = vrrm_replica:reconfigure(Primary, NewConfig, 6),
+    ok = vrrm_cli:reconfigure(Primary, NewConfig),
 
     timer:sleep(200),
 
@@ -122,10 +122,10 @@ blackboard(Config) ->
     lager:info("modstate ~p", [ModState]),
     1 = length(ModState),
 
-    {ok, bar} = vrrm_replica:request(NewPrimary, {get, foo}, 7),
+    {ok, bar} = vrrm_cli:request(NewPrimary, {get, foo}),
 
-    {ok, ok} = vrrm_replica:request(NewPrimary, {put, foo, blort}, 8),
-    {ok, blort} = vrrm_replica:request(NewPrimary, {get, foo}, 9),
+    ok = vrrm_cli:request(NewPrimary, {put, foo, blort}),
+    {ok, blort} = vrrm_cli:request(NewPrimary, {get, foo}),
 
     false = is_process_alive(Primary),
 
@@ -135,18 +135,15 @@ blackboard(Config) ->
     Ct = 100000,
     Time =
         timer:tc(fun() ->
-                         _ = [vrrm_replica:request(NewPrimary,
-                                                   {put, ctr, N},
-                                                   9 + N)
+                         _ = [vrrm_cli:request(NewPrimary,
+                                                   {put, ctr, N})
                               || N <- lists:seq(1, Ct)]
                  end),
 
     {TimeNs, _} = Time,
 
     TimeSec = TimeNs div 1000000,
-    {ok, Ct} = vrrm_replica:request(NewPrimary,
-                                    {get, ctr},
-                                    9 + Ct + 10),
+    {ok, Ct} = vrrm_cli:request(NewPrimary, {get, ctr}),
 
     lager:warning("Time ~p in ~p", [Ct, TimeSec]),
 
