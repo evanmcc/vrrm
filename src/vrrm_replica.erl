@@ -4,7 +4,7 @@
 
 %% API
 -export([
-         start_link/4
+         start_link/2, start_link/4
         ]).
 
 %% gen_server callbacks
@@ -161,6 +161,9 @@
 %%% API
 %%%===================================================================
 
+start_link(Mod, ModArgs) ->
+    start_link(Mod, ModArgs, true, #{}).
+
 -spec start_link(atom(), [term()], boolean(), #{}) ->
                         {ok, pid()} |
                         {error, Reason::term()}.
@@ -306,15 +309,24 @@ init([Mod, ModArgs, New, _Opts]) ->
     random:seed(erlang:unique_integer()),
     case New of
         true ->
-            {ok, NextState, ModState} = Mod:init(ModArgs),
-            State =
-                ?S{mod = Mod,
-                   next_state = NextState,
-                   mod_state = ModState
-                  },
-            add_snapshot({NextState, Mod:serialize(ModState)},
-                         0, State?S.log),
-            {ok, State};
+            %% some ugly duplication here; is there a better way to do
+            %% this?
+            case Mod:init(ModArgs) of
+                {ok, NextState, ModState} ->
+                    State = ?S{mod = Mod,
+                               next_state = NextState,
+                               mod_state = ModState},
+                    add_snapshot({NextState, Mod:serialize(ModState)},
+                                 0, State?S.log),
+                    {ok, State};
+                {ok, NextState, ModState, Timeout} ->
+                    State = ?S{mod = Mod,
+                               next_state = NextState,
+                               mod_state = ModState},
+                    add_snapshot({NextState, Mod:serialize(ModState)},
+                                 0, State?S.log),
+                    {ok, State, Timeout}
+            end;
         false ->
             %% here we need to create a node without any
             %% configuration or state (since it'll just get thrown
@@ -855,8 +867,6 @@ handle_info(commit_timeout,
 handle_info(primary_timeout,
             ?S{primary = false, view = View,
                timeout = Timeout, epoch = Epoch} = State) ->
-
-
     %% initiate the view change by incrementing the view number and
     %% sending a start_view change message to all reachable replicas.
     lager:debug("~p detected primary timeout, starting view change",
@@ -866,6 +876,15 @@ handle_info(primary_timeout,
      || R <- Config, is_pid(R)],
     {noreply, State?S{view = View,
                       timeout = replica_timeout(Timeout)}};
+handle_info(timeout, ?S{mod = Mod, next_state = NextState,
+                        mod_state = ModState} = State) ->
+    case Mod:NextState(timeout, ModState) of
+        {next_state, NextState1, ModState1} ->
+            {noreply, State?S{next_state = NextState1,
+                              mod_state = ModState1}};
+        {stop, Reason, ModState1} ->
+            {stop, Reason, State?S{mod_state = ModState1}}
+    end;
 handle_info(Msg, ?S{mod = Mod, mod_state = ModState} = State) ->
     try Mod:handle_info(Msg, ModState) of
         {next_state, NextState1, ModState1} ->

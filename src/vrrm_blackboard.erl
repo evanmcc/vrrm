@@ -2,6 +2,14 @@
 
 -behavior(vrrm_replica).
 
+%% API
+-export([
+         start_link/0,
+         get/2,
+         put/3,
+         cas/4
+        ]).
+
 %% behavior api
 -export([
          init/1,
@@ -22,6 +30,22 @@
         {
           board = #{} :: #{}
         }).
+
+%%% API
+
+start_link() ->
+    vrrm_replica:start_link(?MODULE, []).
+
+get(Primary, Key) ->
+    vrrm_cli:request(Primary, {get, Key}).
+
+put(Primary, Key, Val) ->
+    vrrm_cli:request(Primary, {put, Key, Val}).
+
+cas(Primary, Key, Current, New) ->
+    vrrm_cli:request(Primary, {cas, Key, Current, New}).
+
+%%% behavior
 
 init(_) ->
     {ok, accepting, ?S{}}.

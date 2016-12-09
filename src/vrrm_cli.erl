@@ -26,8 +26,11 @@ primary(#cli{config = [Primary|_]}) ->
 
 %% two-arity form uses the pdict for lighter-weight use (silly
 %% state-using protocol).
+request(undefined, _Request) ->
+    {error, cannot_find_node};
 request(Replica, Request) when is_atom(Replica) ->
     %% will this loop when the local replica is perma-dead?
+    lager:info("a thing"),
     request(whereis(Replica), Request);
 request(Replica, Request) when is_pid(Replica) ->
     Cli =
@@ -50,6 +53,8 @@ request(Replica, Request) when is_pid(Replica) ->
             {error, Reason}
     end.
 
+request(undefined, _Request, Client) ->
+    {error, cannot_find_node, Client};
 request(Replica, Request, Client) when is_atom(Replica) ->
     request(whereis(Replica), Request, Client);
 request(Replica, Request,

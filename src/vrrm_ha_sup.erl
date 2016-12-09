@@ -1,6 +1,6 @@
 -module(vrrm_ha_sup).
 
--behavior(vrrm_replica).
+-behaviour(vrrm_replica).
 
 %% this code is obviously influenced by reading supervisor.erl, but
 %% it's massively simplified for now.
@@ -10,40 +10,7 @@
 %% don't go as we expect.  this is not ideal, I suppose, but it isn't
 %% clear how we manage, otherwise.
 
--define(S, #vrrm_ha_sup_state).
-
--type strategy() :: one_for_one.
-
--record(vrrm_ha_sup_state,
-        {
-          %% supervisor state
-          strategy = one_for_one :: strategy(),
-          children = [] :: [child()],
-          intensity :: pos_integer(),
-          period :: non_neg_integer(),
-          mod :: atom(),
-          args :: [term()],
-
-          %% quorum state, do we need this?
-          primary :: pid(),
-
-          %% client
-          client :: vrrm_cli:cli()
-        }).
-
--record(child,
-         {
-          name :: atom(),
-          pid :: pid(),
-          mfa :: {atom(), atom(), [term()]},
-          restart :: temporary | permanent,
-          shutdown_timeout :: pos_integer(),
-          supervisor :: boolean()
-         }).
-
--type child() :: #child{}.
-
--callback init(Args :: term()) ->
+-callback init(Args::[term()]) ->
     {ok, term()}.
 
 %%% API
@@ -70,10 +37,44 @@
          accepting/2
         ]).
 
+-define(S, #vrrm_ha_sup_state).
+
+-type strategy() :: one_for_one.
+
+-record(vrrm_ha_sup_state,
+        {
+          %% supervisor state
+          strategy = one_for_one :: strategy(),
+          children = [] :: [child()],
+          specs :: [term()],
+          intensity :: pos_integer(),
+          period :: non_neg_integer(),
+          mod :: atom(),
+          args :: [term()],
+
+          %% quorum state, do we need this?
+          primary :: pid(),
+          
+          %% client
+          client :: vrrm_cli:cli()
+        }).
+
+-record(child,
+         {
+          name :: atom(),
+          pid :: pid(),
+          mfa :: {atom(), atom(), [term()]},
+          restart :: temporary | permanent,
+          shutdown_timeout :: pos_integer(),
+          supervisor :: boolean()
+         }).
+
+-type child() :: #child{}.
+
 %%% API implmentation
 
 start_link(Mod, Args) ->
-    vrrm_replica:start_link(?MODULE, [Mod, Args], true, []).
+    vrrm_replica:start_link(?MODULE, {Mod, Args}, true, []).
 
 %% for the moment, we only allow one ha_sup per node
 
@@ -96,28 +97,31 @@ count_children() ->
 init({Mod, Args}) ->
     process_flag(trap_exit, true),
     register(?MODULE, self()),
+    lager:info("starting ha sup: ~p ~p", [Mod, Args]),
     case Mod:init(Args) of
         {ok, {SupFlags, StartSpec}} ->
             %% bomb out unless one_for one for now
             {one_for_one, Intensity, Period} = SupFlags,
-            Children = init_children(StartSpec),
             {ok, starting,
              ?S{strategy = one_for_one,
                 intensity = Intensity,
                 period = Period,
                 mod = Mod,
                 args = Args,
+                specs = StartSpec,
                 %% convert into a map by name
-                children = maps:from_list(Children),
+                %%children = maps:from_list(Children),
                 client = vrrm_cli:new()
-               }};
+               },
+             %% transition immediately to starting for bootstrap
+             0};
         _Err ->
             {stop, {bad_init, Mod, Args, _Err}}
     end.
 
 init_children(Children) ->
     [begin
-         {ok, Pid} = spawn_link(M, F, A),
+         Pid = spawn_link(M, F, A),
          SupP = SupType =:= supervisor,
          {Name,
           #child{name = Name,
@@ -142,8 +146,9 @@ terminate(Reason, State) ->
     terminate_children(Reason, State?S.children),
     ok.
 
-starting(_Msg, ?S{client = Cli} = State) ->
+starting(timeout, ?S{client = Cli, specs = Specs} = State) ->
     %% bootstrap into the quorum, or wait for enough nodes
+    lager:info("beginning boostrap"),
     {ok, Nodes} = wait_for_min_quorum_size(30),
     case quorum_exists(Nodes) of
         {true, Primary} ->
@@ -163,17 +168,24 @@ starting(_Msg, ?S{client = Cli} = State) ->
                     ok
             end
     end,
+    %% now that we're a proper part of our quorum, start children
+    Children = init_children(Specs),
     {next_state, accepting,
-     State?S{primary = Primary, client = Cli1}}.
+     State?S{primary = Primary, client = Cli1,
+             children = maps:from_list(Children)}}.
 
 quorum_exists(Nodes) ->
     %% ideally this would be in parallel
+    Me = self(),
+    _ = [spawn(?MODULE, get_config, [Node, Me]) %gen_server:call({?MODULE, Node}, get_config)
+         || Node <- Nodes],
     Replies = [gen_server:call({?MODULE, Node}, get_config)
                || Node <- Nodes],
     case [R || R <- Replies, R /= not_primary] of
         %% this should only happen on a live cluster
         [Config] ->
             [Primary|_] = Config,
+            lager:info("quorum exists: ~p", [Config]),
             {true, Primary};
         [] ->
             %% ideally this would also be parallel
@@ -217,8 +229,8 @@ accepting(which_children, ?S{children = Children} = State) ->
 
 handle_info({'EXIT', Pid, Info},
             ?S{children = Children} = State) ->
-    lager:info("supervised process ~p exited with reason ~p",
-               [Pid, Info]),
+    lager:info("supervised process ~p exited with reason ~p~n~p",
+               [Pid, Info, Children]),
     %% try once then die, eventually deal with restart intensity
     [Child] = [C || #child{pid = P} = C <- maps:to_list(Children),
                     P =:= Pid],

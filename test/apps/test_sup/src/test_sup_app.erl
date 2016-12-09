@@ -3,22 +3,21 @@
 %% @end
 %%%-------------------------------------------------------------------
 
--module('test_sup_app').
+-module(test_sup_app).
 
 -behaviour(application).
 
 %% Application callbacks
--export([start/2
-        ,stop/1]).
+-export([start/2,
+         stop/1]).
 
 %%====================================================================
 %% API
 %%====================================================================
 
 start(_StartType, _StartArgs) ->
-    'test_sup_sup':start_link().
+    test_sup_sup:start_link().
 
-%%--------------------------------------------------------------------
 stop(_State) ->
     ok.
 

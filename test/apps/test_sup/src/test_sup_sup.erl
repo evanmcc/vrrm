@@ -3,7 +3,7 @@
 %% @end
 %%%-------------------------------------------------------------------
 
--module('test_sup_sup').
+-module(test_sup_sup).
 
 -behaviour(supervisor).
 

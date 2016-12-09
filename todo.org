@@ -1,8 +1,8 @@
-- [-] 0.2.0 [1/14]
-  - [ ] write vrrm_cli [0/3]
-    - [ ] basic client
+- [-] 0.2.0 [1/15]
+  - [-] write vrrm_cli [2/3]
+    - [X] basic client
     - [ ] reconfiguration handling
-    - [ ] rework testing to use the client
+    - [X] rework testing to use the client
   - [ ] write ha sup [0/4]
     - [ ] bootstrapping
     - [ ] basic sup
@@ -11,16 +11,17 @@
     - [ ] full supervisor compatibility
   - [ ] deduplicate core replication logic
   - [ ] fancier/pluggable log implementations
-  - [ ] refactor core logic into and FSM
+  - [ ] refactor core logic into an FSM
   - [X] basic log compaction
   - [ ] checkpoint state to disk
   - [ ] resumable clusters
   - [ ] GC old client requests
+  - [ ] make fsms leadership aware (change callback arities)
   - [ ] more basic FSMs
     - [ ] CAS register
     - [ ] set
     - [ ] counter
-    - [ ] spinlock?
+    - [ ] ticket/epoch spinlock
   - [ ] vrrm_replica behavior improvements
     - [ ] actually use serialize and deserialize
     - [ ] implement handle_info
