@@ -4,7 +4,7 @@
 
 %% API
 -export([
-         start_link/4
+         start_link/2, start_link/4
         ]).
 
 %% gen_server callbacks
@@ -37,6 +37,7 @@
          request/3, request/4,
          initial_config/2,
          get_config/1,
+         get_status/1,
          reconfigure/3,
          get_mod_state/1,
          state_transfer/1,
@@ -45,20 +46,19 @@
          %% swap_node/2
         ]).
 
+%% should rewrite this to use the statem
+-type nodename() :: pid() | atom().
+-export_type([nodename/0]).
 -callback init(Args::[term()]) ->
     {ok, StateName::atom(), ModState::term()} |
     {error, Reason::term()}.
 
 %% any number of states can defined by the behavior, which must
 %% express them:
-%% Mod:StateName(Event::term(), ModState::term()) ->
+%% Mod:StateName(Event::term(), Role::atom(), ModState::term()) ->
 %%     {next_state, NextStateName, UpdModState} |
 %%     {reply, Reply, NextStateName, UpdModState} |
 %%     {stop, UpdModState}.
-
--callback handle_info(Msg::term(), State::term()) ->
-    {next_state, NextState::atom(), State::term()} |
-    {stop, Reason::term(), State::term()}.
 
 -callback serialize(State::term()) ->
     {ok, SerializedState::term()} | {error, Reason::term()}.
@@ -81,7 +81,7 @@
 %% easier and less duplicative.
 -record(msg,
         {
-          view :: non_neg_integer(),
+          view :: non_neg_integer() | undefined,
           epoch :: non_neg_integer(),
           sender :: pid(),
           payload :: term()
@@ -109,28 +109,28 @@
           committed = false :: boolean(),
           client :: client()
         }).
--type operation() :: #operation{}.
+%-type operation() :: #operation{}.
 
 -record(request,
         {
           req_num :: non_neg_integer(),
-          op :: operation(),
+          op :: non_neg_integer(),
           view :: non_neg_integer(),
-          reply :: term(),
-          from :: tuple()
+          reply :: term() | undefined,
+          from :: tuple() | undefined
         }).
 -type request() :: #request{}.
 
 -record(replica_state,
         {
           %% replication state
-          primary :: boolean(),
-          config :: [pid() | atom() | {failed, pid()}], % nodenames
+          primary = false :: boolean(),
+          config = [] :: [nodename() | {failed, nodename()}], % nodenames
 
           timeout = make_ref() :: reference(),
 
           view = 0 :: non_neg_integer(),
-          last_normal :: non_neg_integer(),
+          last_normal = 0 :: non_neg_integer(),
           status = unconfigured :: unconfigured |
                                    normal |
                                    view_change |
@@ -144,10 +144,10 @@
           commit = 0 :: non_neg_integer(),
           client_table = #{} :: #{pid() => client()},
           epoch = 0 :: non_neg_integer(),
-          old_config :: [atom()],
+          old_config = []:: [nodename()],
 
-          pending_replies = [] :: [],
-          nonce :: binary(),
+          pending_replies = [] :: [any()],
+          nonce :: binary() | undefined,
 
           %% callback module state
           mod :: atom(),
@@ -161,6 +161,9 @@
 %%% API
 %%%===================================================================
 
+start_link(Mod, ModArgs) ->
+    start_link(Mod, ModArgs, true, #{}).
+
 -spec start_link(atom(), [term()], boolean(), #{}) ->
                         {ok, pid()} |
                         {error, Reason::term()}.
@@ -169,12 +172,14 @@ start_link(Mod, ModArgs, New, Opts) ->
 
 %% request is should be abstracted to the vrrm_client module, mostly.
 -spec request(pid(), term(), vrrm_client:id(), non_neg_integer()) ->
-                     {ok, Reply::term()} |
+                     {ok, Reply::term(), Epoch::non_neg_integer()} |
+                     {error, not_primary, Primary::nodename()} |
                      {error, Reason::term()}.
 request(Primary, Command, Request) ->
     request(Primary, Command, Request, 500).
 
 request(Primary, Command, Request, Timeout) ->
+    lager:info("request ~p", [Request]),
     try
         gen_server:call(Primary, {request, Command, self(), Request}, Timeout)
     catch C:E ->
@@ -182,13 +187,18 @@ request(Primary, Command, Request, Timeout) ->
             {error, timeout}
     end.
 
-initial_config(Replica, Config) ->
+initial_config(Replica, Config0) ->
+    Config = stable_sort(Config0),
     gen_server:call(Replica, {initial_config, Config}, infinity).
 
 get_config(Replica) ->
     gen_server:call(Replica, get_config).
 
-reconfigure(Primary, NewConfig, Request) ->
+get_status(Replica) ->
+    gen_server:call(Replica, get_status).
+
+reconfigure(Primary, NewConfig0, Request) ->
+    NewConfig = stable_sort(NewConfig0),
     gen_server:call(Primary, {reconfigure, NewConfig, self(), Request},
                     infinity).
 
@@ -205,7 +215,7 @@ state_transfer(Replica) ->
     gen_server:call(Replica, state_transfer, infinity).
 
 %% internal messages
--record(prepare, {primary :: pid(), command :: term(),
+-record(prepare, {primary :: nodename(), command :: term(),
                   client :: pid(), request :: non_neg_integer(),
                   op :: non_neg_integer(), commit :: non_neg_integer()}).
 prepare(Replica, View, Command, Client, Request, Op, Commit, Epoch) ->
@@ -273,9 +283,9 @@ recovery(Replica, Nonce, View, Epoch) ->
                                   payload =
                                       #recovery{nonce = Nonce}}).
 
--record(recovery_response, {nonce :: binary(), log :: [term()],
-                            op :: non_neg_integer(),
-                            commit :: non_neg_integer()}).
+-record(recovery_response, {nonce :: binary(), log :: [term()] | undefined,
+                            op :: non_neg_integer() | undefined,
+                            commit :: non_neg_integer() | undefined}).
 recovery_response(Replica, View, Nonce, Log, Op, Commit, Epoch) ->
     gen_server:cast(Replica, #msg{view = View, epoch = Epoch, sender = self(),
                                   payload =
@@ -303,18 +313,27 @@ epoch_started(Replica, Epoch) ->
 %%%===================================================================
 
 init([Mod, ModArgs, New, _Opts]) ->
-    random:seed(erlang:unique_integer()),
+    rand:seed(exs64),
     case New of
         true ->
-            {ok, NextState, ModState} = Mod:init(ModArgs),
-            State =
-                ?S{mod = Mod,
-                   next_state = NextState,
-                   mod_state = ModState
-                  },
-            add_snapshot({NextState, Mod:serialize(ModState)},
-                         0, State?S.log),
-            {ok, State};
+            %% some ugly duplication here; is there a better way to do
+            %% this?
+            case Mod:init(ModArgs) of
+                {ok, NextState, ModState} ->
+                    State = ?S{mod = Mod,
+                               next_state = NextState,
+                               mod_state = ModState},
+                    add_snapshot({NextState, Mod:serialize(ModState)},
+                                 0, State?S.log),
+                    {ok, State};
+                {ok, NextState, ModState, Timeout} ->
+                    State = ?S{mod = Mod,
+                               next_state = NextState,
+                               mod_state = ModState},
+                    add_snapshot({NextState, Mod:serialize(ModState)},
+                                 0, State?S.log),
+                    {ok, State, Timeout}
+            end;
         false ->
             %% here we need to create a node without any
             %% configuration or state (since it'll just get thrown
@@ -326,11 +345,13 @@ init([Mod, ModArgs, New, _Opts]) ->
 handle_call({request, _Command, _Client, _Request},
             _From,
             ?S{primary = false, config = Config} = State) ->
+    lager:info("recieved a request when not primary"),
     Primary = find_primary(Config),
     {reply, {error, not_primary, Primary}, State};
 handle_call({request, _Command, _Client, _Request},
             _From,
             ?S{primary = true, status = transitioning} = State) ->
+    lager:info("recieved a request while reconfiguring"),
     {reply, reconfiguring, State};
 handle_call({request, Command, Client, Request},
             From,
@@ -338,7 +359,7 @@ handle_call({request, Command, Client, Request},
                view = View, op = Op, epoch = Epoch,
                client_table = Table, config = Config} = State) ->
     %% are we primary? ignore (or reply not_primary?) if not
-    lager:debug("~p request: command ~p client ~p request ~p",
+    lager:info("~p request: command ~p client ~p request ~p",
                 [self(), Command, Client, Request]),
     %% compare with recent requests table, resend reply if
     %% already completed
@@ -369,16 +390,18 @@ handle_call({request, Command, Client, Request},
                               client_table = Table1,
                               timeout = primary_timeout(Timeout)}}
     end;
-handle_call({initial_config, Config}, _From, State) ->
+handle_call({initial_config, Config0}, _From, State) ->
     %% should check that we're in unconfigured+config=undefined
+    Config = lists:sort(Config0),
     [Primary | _] = Config,  %% maybe OK?
     AmPrimary = self() =:= Primary,
-    lager:debug("~p inserting initial configuration, primary: ~p, ~p",
+    lager:info("~p inserting initial configuration, primary: ~p, ~p",
                 [self(), Primary, AmPrimary]),
     Timeout =
         case AmPrimary of
             true ->
                 %% trigger initial view change
+                %timer:sleep(50), % XXX HAX TODO HALP
                 [start_view_change(R, 1, 0)
                  || R <- Config],
                 %% haxx
@@ -396,6 +419,9 @@ handle_call(get_config, _From, ?S{primary = false, config = Config} = State) ->
     {reply, {error, not_primary, Primary}, State};
 handle_call(get_config, _From, ?S{config = Config} = State) ->
     {reply, Config, State};
+%% is this safe on non-primary nodes?
+handle_call(get_status, _From, ?S{status = Status} = State) ->
+    {reply, {ok, Status}, State};
 handle_call({reconfigure, _NewConfig, _Client, _Request}, _From,
             ?S{primary = false, config = Config} = State) ->
     Primary = find_primary(Config),
@@ -526,7 +552,7 @@ handle_cast(#msg{payload = #prepare_ok{op = Op} = Msg},
     %% do we have f replies? if no, wait for more (or timeout)
     F = f(State?S.config),
     OKs = scan_pend(prepare_ok, {Op, View}, Pending),
-    lager:debug("~p prepare_ok: ~p, ~p N ~p F ~p ~p",
+    lager:info("~p prepare_ok: ~p, ~p N ~p F ~p ~p",
                 [self(), Msg, Pending, OKs, F, {View, Op}]),
     case length(OKs ++ [Msg]) of
         N when N >= F ->
@@ -608,9 +634,10 @@ handle_cast(#msg{payload=#start_view_change{}, view=View, epoch=Epoch,
             ?S{op = Op, view = OldView,
                config = Config, log = Log0, status = Status,
                commit = Commit, timeout = Timeout} = State) ->
-    lager:debug("~p start_view_change: ~p", [self(), View]),
+    lager:info("~p start_view_change: ~p", [self(), View]),
     %% calculate new primary here
     ExistingPrimary = find_primary(Config),
+    lager:info("primary calc ~p ~p", [ExistingPrimary, Sender]),
     {Primary, Config1} =
         case Sender of
             ExistingPrimary ->
@@ -702,7 +729,7 @@ handle_cast(#msg{payload=out_of_date, view = View, epoch = Epoch},
             ?S{config = Config} = State) ->
     %% moderately sure that epoch handling here is wrong.  how to test?
     lager:debug("~p out_of_date", [self()]),
-    Nonce = crypto:rand_bytes(16),
+    Nonce = crypto:strong_rand_bytes(16),
     [recovery(Replica, Nonce, View, Epoch)
      || Replica <- Config, is_pid(Replica), Replica /= self()],
     {noreply, State?S{view = View, epoch = Epoch,
@@ -722,7 +749,7 @@ handle_cast(#msg{payload=#recovery{nonce = Nonce}, sender = Sender},
                config = Config} = State) ->
     %% if primary, include additional information
     lager:debug("~p recovery, primary", [self()]),
-    Config1 = unfail_replica(Sender, Config),
+    Config1 = unfail_replica({node(Sender), Sender}, Config),
     Log = ship_log(Log0),
     recovery_response(Sender, View, Nonce, Log, Op, Commit, Epoch),
     {noreply, State?S{config = Config1}};
@@ -749,7 +776,7 @@ handle_cast(#msg{payload=#recovery_response{nonce = Nonce} = Msg,
             {NextState1, ModState1, {OldConfig1, Config2}} =
                 do_upcalls(Mod, NextState, ModState, LocalLog,
                            {OldConfig, Config}, Commits),
-            Config1 = unfail_replica(self(), Config2),
+            Config1 = unfail_replica({node(), self()}, Config2),
             Pending1 = clean_pend(recovery_response, Nonce, Pending),
             case Config1 =/= Config andalso
                 not lists:member(self(), Config1) of
@@ -855,17 +882,24 @@ handle_info(commit_timeout,
 handle_info(primary_timeout,
             ?S{primary = false, view = View,
                timeout = Timeout, epoch = Epoch} = State) ->
-
-
     %% initiate the view change by incrementing the view number and
     %% sending a start_view change message to all reachable replicas.
-    lager:debug("~p detected primary timeout, starting view change",
+    lager:info("~p detected primary timeout, starting view change",
                [self()]),
     [_|Config] = State?S.config,
     [start_view_change(R, View + 1, Epoch)
      || R <- Config, is_pid(R)],
     {noreply, State?S{view = View,
                       timeout = replica_timeout(Timeout)}};
+handle_info(timeout, ?S{mod = Mod, next_state = NextState,
+                        mod_state = ModState} = State) ->
+    case Mod:NextState(timeout, ModState) of
+        {next_state, NextState1, ModState1} ->
+            {noreply, State?S{next_state = NextState1,
+                              mod_state = ModState1}};
+        {stop, Reason, ModState1} ->
+            {stop, Reason, State?S{mod_state = ModState1}}
+    end;
 handle_info(Msg, ?S{mod = Mod, mod_state = ModState} = State) ->
     try Mod:handle_info(Msg, ModState) of
         {next_state, NextState1, ModState1} ->
@@ -898,7 +932,7 @@ get_client(Pid, Table) ->
 
 recent(Client, Request, Table) ->
     case maps:find(Client, Table) of
-        [Record] ->
+        {ok, Record} ->
             in_requests(Request, Record#client.requests);
         _ ->
             false
@@ -1179,7 +1213,8 @@ unfail_replica(Replica, [{failed, Replica}|T], Acc) ->
 unfail_replica(Replica, [H|T], Acc) ->
     unfail_replica(Replica, T, [H|Acc]).
 
-find_primary([{failed, _}|T]) ->
+find_primary([{failed, _} = H|T]) ->
+    lager:info("failed primary ~p", [H]),
     find_primary(T);
 find_primary([H|_]) ->
     H.
@@ -1200,8 +1235,13 @@ replica_timeout(TRef) ->
     erlang:send_after(TO, self(), primary_timeout).
 
 jitter(Pct, Num) ->
-    M = 100 + (random:uniform(Pct * 2) - Pct),
+    M = 100 + (rand:uniform(Pct * 2) - Pct),
     (M * Num) div 100.
 
 pick(Lst) ->
-    lists:nth(random:uniform(length(Lst)), Lst).
+    lists:nth(rand:uniform(length(Lst)), Lst).
+
+stable_sort(Replicas) ->
+    NRs =[{node(Replica), Replica} || Replica <- Replicas],
+    lists:sort(NRs),
+    [Replica || {_Nodename, Replica} <- NRs].

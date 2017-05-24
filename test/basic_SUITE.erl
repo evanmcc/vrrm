@@ -6,12 +6,22 @@ suite() ->
     [{timetrap,{minutes,30}}].
 
 init_per_suite(Config) ->
-    ok = lager:start(),
+    application:load(lager),
+    application:set_env(lager, handlers,
+                        [{lager_console_backend,
+                          [info,
+                           {lager_default_formatter, [date, " ", time, " ",
+                                                      color, "[", severity, "] ",
+                                                      pid, " ",
+                                                      {module, [
+                                                                "", module, ":",
+                                                                {function, ["", function, ":"], ""},
+                                                                {line, ["",line], ""}], ""},
+                                                      " ", message, "\n"]}]}]),
+    lager:start(),
     ok = application:start(vrrm),
     application:set_env(vrrm, idle_commit_interval, 250),
     application:set_env(vrrm, primary_failure_interval, 400),
-
-    lager_common_test_backend:bounce(info),
     Config.
 
 end_per_suite(_Config) ->
@@ -53,7 +63,7 @@ blackboard(Config) ->
 
     Replicas = lists:sort(Replicas0),
     %% have to reverse because of initial view change and synchrony
-    %% problems, need a better solution later for initial vier stuff
+    %% problems, need a better solution later for initial view stuff
     [vrrm_replica:initial_config(R, Replicas)
      || R <- lists:reverse(Replicas)],
 
