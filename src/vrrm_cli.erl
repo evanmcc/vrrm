@@ -2,7 +2,7 @@
 
 -export([
          new/0,
-         primary/1,
+         primary/0, primary/1,
          request/2, request/3,
          reconfigure/2, reconfigure/3
         ]).
@@ -11,7 +11,7 @@
         {
           request = 0 :: non_neg_integer(),
           epoch = 0 :: non_neg_integer(),
-          config :: [pid()]
+          config = [] :: [pid()]
         }).
 
 -opaque cli() :: #cli{}.
@@ -20,6 +20,14 @@
 
 new() ->
     #cli{}.
+
+primary() ->
+    case get('$vrrm_cli_state') of
+        undefined ->
+            {error, no_active_client};
+        C ->
+            primary(C)
+        end.
 
 primary(#cli{config = [Primary|_]}) ->
     Primary.
@@ -58,12 +66,13 @@ request(undefined, _Request, Client) ->
 request(Replica, Request, Client) when is_atom(Replica) ->
     request(whereis(Replica), Request, Client);
 request(Replica, Request,
-        #cli{config = undefined} = Client) ->
+        #cli{config = []} = Client) ->
     Config = vrrm_replica:get_config(Replica),
     request(Replica, Request, Client#cli{config = Config});
 request(Replica, Request,
         #cli{request = Next, epoch = Epoch,
              config = Config} = Client) ->
+    lager:info("cli making request ~p to ~p", [Request, Replica]),
     case vrrm_replica:request(Replica, Request, Next) of
         {ok, Reply, ClusterEpoch} ->
             case ClusterEpoch of
@@ -120,7 +129,7 @@ reconfigure(Replica, Request) when is_pid(Replica) ->
     end.
 
 reconfigure(Replica, Request,
-        #cli{config = undefined} = Client) ->
+        #cli{config = []} = Client) ->
     Config = vrrm_replica:get_config(Replica),
     reconfigure(Replica, Request, Client#cli{config = Config});
 reconfigure(Replica, Request,

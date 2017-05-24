@@ -2,6 +2,7 @@
  [{description, "Viewstamped replication (revisited) consensus library"},
   {vsn, semver},
   {registered, []},
+  {mod, {vrrm_app, []}},
   {applications,
    [
     kernel,

@@ -3,74 +3,75 @@
 -compile(export_all).
 
 -include_lib("common_test/include/ct.hrl").
+-include_lib("eunit/include/eunit.hrl").
 
 suite() ->
     [{timetrap,{minutes,30}}].
 
 init_per_suite(Config) ->
-    lager_common_test_backend:bounce(info),
-    %% make a release as test, should likely use better exit status
-    %% stuff rather than assuming that it passes
-    %% lager:info("~p", [os:cmd("pwd")]),
-    BR = os:cmd("(cd ../../../..; rebar3 as test release)"),
-    lager:info("BR: ~p", [BR]),
+    application:ensure_all_started(lager),
+    application:load(vrrm),
+    lager:start(),
 
     %% start several nodes
+    ErlFlags =  "-config ../../../../test/config/sys.config",
+        %%"-args_file ../../../../test/config/vm.args",
+    ct:pal("path ~p", [os:cmd("pwd")]),
+    CodePath = code:get_path(),
+    NodeName = list_to_atom("testrunner@" ++ hostname()),
+    {ok, _Pid} = net_kernel:start([NodeName, shortnames]),
+    timer:sleep(2500),
     Nodes =
         [begin
              N = integer_to_list(N0),
-             Name = "test_sup_" ++ N ++ "@127.0.0.1",
-             Env = [{"RELX_REPLACE_OS_VARS", "true"},
-                    {"NODE_NAME", Name}],
-             Cmd = "../../rel/test_sup/bin/test_sup console",
-             Pid = cmd(Cmd, Env),
-             lager:info("cmd ~p ~p", [Cmd, Env]),
-             %%timer:sleep(1000),
-             {Pid, list_to_atom(Name)}
+             Name = test_node(N),
+             {ok, HostNode} = ct_slave:start(
+                                Name,
+                                [{kill_if_fail, true},
+                                 {monitor_master, true},
+                                 {init_timeout, 3000},
+                                 {startup_timeout, 3000},
+                                 {startup_functions,
+                                  [{code, set_path, [CodePath]},
+                                   {application, load, [lager]},
+                                   {application, set_env,
+                                    [lager, handlers,
+                                     [{lager_file_backend,
+                                       [{file, "console"++N++".log"}, {level, info}]}]]},
+                                   {application, ensure_all_started, [vrrm]}]},
+                                 {erl_flags, ErlFlags}]),
+             HostNode
          end
          || N0 <- lists:seq(1, 5)],
 
-    %% Collect pids here (actually, using console + cmd() we don't
-    %% need to, because console will exit when the testrunner exits).
-    lager:debug("ps ~p", [os:cmd("ps aux | grep beam.sm[p]")]),
-
-    %% establish disterl connections to each of them
-    NodeName = 'testrunner@127.0.0.1',
-    net_kernel:start([NodeName]),
-    erlang:set_cookie(node(), test_sup_cookie),
     [begin
-         lager:debug("attaching to ~p", [Node]),
-         connect(Node, 50, 40)
+        true = net_kernel:hidden_connect_node(Node)%,
+        %pong = net_adm:ping(Node)
      end
-     || {_Pid, Node} <- Nodes],
-    [{nodes, Nodes}|Config].
+     || Node <- Nodes],
+    [First | Rest] = Nodes,
+    [rpc:call(Node, net_adm, ping, [First])
+     || Node <- Rest],
+    [{nodes, Nodes} | Config].
+
+hostname() ->
+    string:strip(os:cmd("hostname"), right, $\n).
+
+test_node(N) ->
+    list_to_atom("test_sup_" ++ N). % ++ "@" ++ hostname()).
 
 end_per_suite(Config) ->
     %% poorly behaved tests will leak processes here, we should expend
     %% some effort to find them and shut them down
     Nodes = ?config(nodes, Config),
     [begin
-         os:putenv("NODE_NAME", atom_to_list(Node)),
-         os:cmd("test/rel/test_sup/bin/test_sup stop")
+         ct_slave:stop(Node)
      end
-     || {_Pid, Node} <- Nodes],
+     || Node <- Nodes],
     ok.
 
 init_per_group(_, Config) ->
     Config.
-
-connect(Node, _Wait, 0) ->
-    lager:error("could not connect to ~p, exiting", [Node]),
-    exit(disterl);
-connect(Node, Wait, Tries) ->
-    try
-        true = net_kernel:hidden_connect_node(Node),
-        pong = net_adm:ping(Node)
-    catch _:_ ->
-            lager:debug("connect failed: ~p ~p", [Node, Tries]),
-            timer:sleep(Wait),
-            connect(Node, Wait, Tries - 1)
-    end.
 
 end_per_group(_GroupName, Config) ->
     Config.
@@ -91,8 +92,8 @@ groups() ->
      {operations,
       [],
       [
-       start_predefined
-       %% start_dynamic
+       %%start_predefined
+       start_dynamic
        %% terminate_dynamic
        %% kill_random
       ]}
@@ -106,53 +107,32 @@ all() ->
     ].
 
 bootstrap(Config) ->
-    [{_, Lead}|Rest] = _Nodes = ?config(nodes, Config),
-    [begin
-         R = rpc:call(Node, test_sup, join, [Lead]),
-         lager:debug("ret ~p", [R]),
-         ok = R
-     end
-     || {_, Node} <- Rest],
-    timer:sleep(100),
-    [begin
-         R = rpc:call(Node, test_sup, start, [whereis(lager_event)]),
-         lager:info("ret ~p", [R]),
-         {ok, _} = R
-     end
-     || {_, Node} <- [{1, Lead}]], %% Nodes],
-    Entry = rpc:call(Lead, erlang, whereis, [vrrm_ha_sup]),
-    Reply = vrrm_cli:request(Entry, which_children),
-    lager:info("reply ~p", [Reply]),
+    Nodes = ?config(nodes, Config),
+    [First | _] = Nodes,
+    %% allow all the nodes time to see each other
+    timer:sleep(2000), % lower?
+    R = rpc:call(First, vrrm_manager, start_quorum,
+                 [test_quorum, vrrm_blackboard, [], all]),
+    ?assertEqual(ok, R),
+    ok = wait_till_healthy(First),
     Config.
 
-start_predefined(Config) ->
+start_dynamic(Config) ->
     Config.
 
 %% util
 
-cmd(Cmd, Env) ->
-    spawn(fun() ->
-                  P = open_port({spawn, Cmd},
-                                [{env, Env},
-                                 stream, use_stdio,
-                                 exit_status,
-                                 stderr_to_stdout]),
-                  loop(P)
-          end).
+wait_till_healthy(Node) ->
+    wait_till_healthy(Node, 200). % 10 seconds
 
-loop(Port) ->
-    receive
-        stop ->
+wait_till_healthy(_Node, 0) ->
+    {error, took_too_long};
+wait_till_healthy(Node, N) ->
+    case rpc:call(Node, vrrm_manager, quorum_status, [test_quorum]) of
+        normal ->
             ok;
-        {Port, {data, Data}} ->
-            lager:info("port data ~p ~p", [Port, Data]),
-            loop(Port);
-        {Port, {exit_status, Status}} ->
-            case Status of
-                0 ->
-                    lager:debug("port exit ~p ~p", [Port, Status]);
-                _ ->
-                    lager:info("port exit ~p ~p", [Port, Status])
-            end,
-            ok
+        Other ->
+            timer:sleep(50),
+            ct:pal("waiting ~p ~p", [N, Other]),
+            wait_till_healthy(Node, N - 1)
     end.
