@@ -6,18 +6,18 @@ suite() ->
     [{timetrap,{minutes,30}}].
 
 init_per_suite(Config) ->
-    application:load(lager),
-    application:set_env(lager, handlers,
-                        [{lager_console_backend,
-                          [info,
-                           {lager_default_formatter, [date, " ", time, " ",
-                                                      color, "[", severity, "] ",
-                                                      pid, " ",
-                                                      {module, [
-                                                                "", module, ":",
-                                                                {function, ["", function, ":"], ""},
-                                                                {line, ["",line], ""}], ""},
-                                                      " ", message, "\n"]}]}]),
+    %% application:load(lager),
+    %% application:set_env(lager, handlers,
+    %%                     [{lager_console_backend,
+    %%                       [debug,
+    %%                        {lager_default_formatter, [date, " ", time, " ",
+    %%                                                   color, "[", severity, "] ",
+    %%                                                   pid, " ",
+    %%                                                   {module, [
+    %%                                                             "", module, ":",
+    %%                                                             {function, ["", function, ":"], ""},
+    %%                                                             {line, ["",line], ""}], ""},
+    %%                                                   " ", message, "\n"]}]}]),
     lager:start(),
     ok = application:start(vrrm),
     application:set_env(vrrm, idle_commit_interval, 250),
@@ -103,7 +103,7 @@ blackboard(Config) ->
     %% should validate here that this request takes $Timeout ms
     {ok, quux} = vrrm_cli:request(Primary, {get, baz}),
 
-    %% make two new nodes and join them to the cluster
+    %% make three new nodes and join them to the cluster
     NewNodes =
         [begin
              {ok, R} =
@@ -112,14 +112,18 @@ blackboard(Config) ->
              R
          end
          || _ <- lists:seq(1, 3)],
-    %% add three new nodes, with the primary exiting and leaving
+    %% add three new nodes, with the first exiting and leaving
     NewConfig0 = (Replicas ++ NewNodes) -- [Primary],
     NewConfig = lists:sort(NewConfig0),
     [NewPrimary|_] = NewConfig,
     lager:info("starting reconfigure"),
-    ok = vrrm_cli:reconfigure(Primary, NewConfig),
+    case vrrm_cli:reconfigure(Primary, NewConfig) of
+        ok -> ok;
+        {error, _, NewPrimary} ->
+            vrrm_cli:reconfigure(NewPrimary, NewConfig)
+    end,
 
-    timer:sleep(200),
+    timer:sleep(300),
 
     ModState0 =
         [begin
@@ -137,7 +141,18 @@ blackboard(Config) ->
     ok = vrrm_cli:request(NewPrimary, {put, foo, blort}),
     {ok, blort} = vrrm_cli:request(NewPrimary, {get, foo}),
 
-    false = is_process_alive(Primary),
+    true =
+        (fun Loop(0) ->
+                 {error, too_long};
+             Loop(N) ->
+                 case is_process_alive(Primary) of
+                     true ->
+                         timer:sleep(50),
+                         Loop(N - 1);
+                     false ->
+                         true
+                 end
+         end)(20 * 10),
 
     %% eprof:start(),
     %% eprof:start_profiling(NewConfig),

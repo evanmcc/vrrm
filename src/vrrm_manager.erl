@@ -89,11 +89,11 @@ handle_call({start_quorum, Name, Mod, ModArgs, RequestedNodes}, _From,
             {ok, Pid} = vrrm_replica:start_link(Mod, ModArgs, true, #{}),
             QuorumNodes = [Pid | QuorumNodes0],
             lager:info("quorum nodes: ~p", [QuorumNodes]),
+            vrrm_replica:initial_config(Pid, QuorumNodes),
             [gen_server:call({?SERVER, Node},
                              {config_quorum, Name, QuorumNodes},
                              ReplyWait)
              || Node <- FilteredList],
-            vrrm_replica:initial_config(Pid, QuorumNodes),
             Q2 = Quora#{Name => #{mod => Mod,
                                   mod_args => ModArgs,
                                   pid => Pid,
@@ -128,7 +128,7 @@ handle_call({quorum_status, Name}, _From,
                         lager:info("primary? ~p", [Primary]),
                         {ok, Status} = vrrm_replica:get_status(Primary),
                         Status;
-                    L when is_list(L) ->
+                    {ok, L} when is_list(L) ->
                         {ok, Status} = vrrm_replica:get_status(Pid),
                         Status
                 end,
