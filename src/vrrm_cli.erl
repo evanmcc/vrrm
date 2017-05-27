@@ -67,7 +67,7 @@ request(Replica, Request, Client) when is_atom(Replica) ->
     request(whereis(Replica), Request, Client);
 request(Replica, Request,
         #cli{config = []} = Client) ->
-    Config = vrrm_replica:get_config(Replica),
+    {ok, Config} = vrrm_replica:get_config(Replica),
     request(Replica, Request, Client#cli{config = Config});
 request(Replica, Request,
         #cli{request = Next, epoch = Epoch,
@@ -123,14 +123,13 @@ reconfigure(Replica, Request) when is_pid(Replica) ->
         {ok, Reply, Cli1} ->
             put('$vrrm_cli_state', Cli1),
             {ok, Reply};
-        {error, Reason, Cli1} ->
-            put('$vrrm_cli_state', Cli1),
-            {error, Reason}
+        E ->
+            E % pass errors straight through
     end.
 
 reconfigure(Replica, Request,
         #cli{config = []} = Client) ->
-    Config = vrrm_replica:get_config(Replica),
+    {ok, Config} = vrrm_replica:get_config(Replica),
     reconfigure(Replica, Request, Client#cli{config = Config});
 reconfigure(Replica, Request,
             #cli{request = Next, epoch = Epoch,
