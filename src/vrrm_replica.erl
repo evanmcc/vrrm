@@ -19,9 +19,9 @@
 %%% messages
 -export([
          %% async
-         prepare/8,
+         prepare/9,
          prepare_ok/4,
-         commit/4,
+         commit/5,
 
          start_view_change/3,
          do_view_change/7,
@@ -130,11 +130,8 @@
 
           view = 0 :: non_neg_integer(),
           last_normal = 0 :: non_neg_integer(),
-          %% status = unconfigured :: unconfigured |
-          %%                          normal |
-          %%                          view_change |
-          %%                          recovering |
-          %%                          transitioning,
+          commits = [] :: [non_neg_integer()],
+          min_commit = 0 :: non_neg_integer(),
           log = ets:new(log,
                         [set,
                          {keypos, 2},
@@ -218,14 +215,16 @@ state_transfer(Replica) ->
 %% internal messages
 -record(prepare, {primary :: nodename(), command :: term(),
                   client :: pid(), request :: non_neg_integer(),
-                  op :: non_neg_integer(), commit :: non_neg_integer()}).
-prepare(Replica, View, Command, Client, Request, Op, Commit, Epoch) ->
+                  op :: non_neg_integer(), commit :: non_neg_integer(),
+                  min_commit :: non_neg_integer()}).
+prepare(Replica, View, Command, Client, Request, Op, Commit, MinCommit, Epoch) ->
     gen_statem:cast(Replica,
                     #msg{view = View, epoch = Epoch, sender = self(),
                          payload =
                              #prepare{primary = self(), op = Op,
                                       client = Client, request = Request,
-                                      command = Command, commit = Commit}}).
+                                      command = Command, commit = Commit,
+                                      min_commit = MinCommit}}).
 
 -record(prepare_ok, {op :: non_neg_integer(), sender :: pid(),
                      view :: non_neg_integer()}).
@@ -233,16 +232,15 @@ prepare_ok(Replica, View, Op, Epoch) ->
     gen_statem:cast(Replica, #msg{view = View, epoch = Epoch, sender = self(),
                                   payload =
                                       #prepare_ok{op = Op,
-                                                  %% not sure if this
-                                                  %% can be deduplicated
-                                                  view = View,
+                                                  view = View, % required for filtering
                                                   sender = self()}}).
 
--record(commit, {commit :: non_neg_integer()}).
-commit(Replica, Commit, View, Epoch) ->
+-record(commit, {commit :: non_neg_integer(), min_commit :: non_neg_integer()}).
+commit(Replica, Commit, MinCommit, View, Epoch) ->
     gen_statem:cast(Replica, #msg{view = View, epoch = Epoch, sender = self(),
                                   payload =
-                                      #commit{commit = Commit}}).
+                                      #commit{commit = Commit,
+                                              min_commit = MinCommit}}).
 
 -record(start_view_change, {view :: non_neg_integer(), sender :: pid(),
                             epoch :: non_neg_integer()}).
@@ -374,6 +372,7 @@ handle_event({call, From}, {initial_config, Config}, unconfigured, Data) ->
         end,
     {next_state, normal,
      Data?D{config = Config,
+            commits = lists:duplicate(length(Config), 0),
             primary = AmPrimary,
             timeout = Timeout},
      [{reply, From, ok}]};
@@ -400,7 +399,8 @@ handle_event({call, From},
              normal,
              ?D{log = Log, commit = Commit, timeout = Timeout,
                 view = View, op = Op, epoch = Epoch,
-                client_table = Table, config = Config} = Data) ->
+                client_table = Table, config = Config,
+                commits = Commits} = Data) ->
     lager:info("~p request: command ~p client ~p request ~p",
                 [self(), Command, Client, Request]),
     %% compare with recent requests table, resend reply if
@@ -424,9 +424,10 @@ handle_event({call, From},
                                      view = View,
                                      req_num = Request,
                                      from = From},
+            MinCommit = find_min_commit(Commits),
             Table1 = add_request(Client, ClientRecord, RequestRecord, Table),
             [prepare(Replica, View, Command, Client, Request,
-                     Op1, Commit, Epoch)
+                     Op1, Commit, MinCommit, Epoch)
              || Replica <- Config, Replica /= self(), is_pid(Replica)],
             {next_state, normal,
              Data?D{op = Op1,
@@ -455,7 +456,7 @@ handle_event({call, From},
              normal,
             ?D{config = Config, primary = true,
                log = Log, client_table = Table, view = View,
-               timeout = Timeout,
+               timeout = Timeout, commits = Commits,
                commit = Commit, op = Op, epoch = Epoch} = Data) ->
     %% validate new config, Epoch == epoch, and Request is not already
     %% processed for this Client (only valid on primary).
@@ -487,8 +488,9 @@ handle_event({call, From},
                                      req_num = Request,
                                      from = From},
             Table1 = add_request(Client, ClientRecord, RequestRecord, Table),
+            MinCommit = find_min_commit(Commits),
             [prepare(Replica, View, {'$reconfigure', NewConfig}, Client,
-                     Request, Op1, Commit, Epoch)
+                     Request, Op1, Commit, MinCommit, Epoch)
              || Replica <- Config, Replica /= self(), is_pid(Replica)],
             {next_state, transitioning,
              Data?D{op = Op1, client_table = Table1,
@@ -503,7 +505,7 @@ handle_event({call, From},
              State,
             ?D{log = Log, commit = Commit, view = View} = Data)
   when State =:= transitioning orelse State =:= normal ->
-    ST = #st{log = ship_log(Log),
+    ST = #st{log = ship_log(Log, 0),
              commit = Commit,
              view = View},
     {next_state, normal, Data, [{reply, From, {ok, ST}}]};
@@ -538,6 +540,7 @@ handle_event(cast, #msg{payload = Payload} = _Msg,
 handle_event(cast,
              #msg{payload = #prepare{primary = Primary, command = Command,
                                      client = Client, request = Request,
+                                     min_commit = MinCommit,
                                      op = Op, commit = Commit},
                   view = View} = Msg,
              normal,
@@ -564,23 +567,32 @@ handle_event(cast,
     {next_state, normal,
      Data?D{op = Op,
             client_table = Table1,
+            min_commit = MinCommit,
             timeout = replica_timeout(Timeout)}};
 handle_event(cast,
-             #msg{payload = #prepare_ok{op = Op}},
+             #msg{payload = #prepare_ok{op = Op}, sender = Sender},
              State,
-             ?D{commit = Commit} = Data)
+             ?D{commit = Commit, config = Config,
+                commits = Commits} = Data)
   when Commit >= Op andalso
        (State =:= normal orelse State =:= transitioning) ->
-    %% ignore these, we've already processed them.
-    {next_state, normal, Data};
+    %% even if this is old and we've already committed the operation
+    %% locally, we need to keep track of the commit for view change
+    %% optimization.
+    RemoteCommit = Op - 1,
+    Commits1 = update_commits(Sender, Config, RemoteCommit, Commits),
+    {next_state, normal, Data?D{commits = Commits1}};
 handle_event(cast,
-             #msg{payload = #prepare_ok{op = Op} = Msg},
+             #msg{payload = #prepare_ok{op = Op},
+                  sender = Sender} = Msg,
              State,
              ?D{mod = Mod, next_state = NextState, mod_state = ModState,
                 client_table = Table, log = Log, view = View,
                 pending_replies = Pending, config = Config,
-                epoch = Epoch} = Data)
+                epoch = Epoch, commits = Commits} = Data)
   when State =:= normal orelse State =:= transitioning ->
+    RemoteCommit = Op - 1,
+    Commits1 = update_commits(Sender, Config, RemoteCommit, Commits),
     %% do we have f replies? if no, wait for more (or timeout)
     F = f(Data?D.config),
     OKs = scan_pend(prepare_ok, {Op, View}, Pending),
@@ -606,7 +618,8 @@ handle_event(cast,
                         Replica /= self()],
                     %% send a commit to the remaining nodes so we
                     %% don't have to wait for one
-                    [commit(Replica, Op, 0, Epoch1)
+                    MinCommit = find_min_commit(Commits1),
+                    [commit(Replica, Op, MinCommit, 0, Epoch1)
                      || Replica <- Config -- NewNodes,
                         Replica /= self(),
                         is_pid(Replica)],
@@ -614,6 +627,8 @@ handle_event(cast,
                     View1 = 0,
                     NextState1 = NextState,
                     ModState1 = ModState,
+                    %% even it we're not the new primary, we can leave
+                    %% our commits list as-is.
                     AmPrimary = self() =:= find_primary(NewConfig, 0);
                 _ ->
                     %% this needs to grow proper handling at some point
@@ -643,21 +658,24 @@ handle_event(cast,
             {next_state, normal,
              Data?D{commit = Op, epoch = Epoch1, view = View1,
                     mod_state = ModState1, next_state = NextState1,
-                    pending_replies = Pending1, primary = AmPrimary}};
+                    pending_replies = Pending1, primary = AmPrimary,
+                    commits = Commits1}};
         _ ->
             %% wait for more
             %% addendum: this is bad FIXME, need to dedupe!
             Pending1 = [Msg|Pending],
-            {next_state, normal, Data?D{pending_replies = Pending1}}
+            {next_state, normal, Data?D{pending_replies = Pending1,
+                                        commits = Commits1}}
     end;
 handle_event(cast,
-             #msg{payload=#commit{commit = Commit},
-                  epoch = Epoch},
+             #msg{payload=#commit{commit = Commit, min_commit = MinCommit},
+                  view = View, epoch = Epoch},
              State,
-             ?D{timeout = Timeout} = Data0)
+             ?D{timeout = Timeout, commits = Commits} = Data1)
   when State =:= transitioning orelse State =:= normal ->
     %% if Commit > commit_num, do upcalls, doing state transfer if
     %% needed.
+    Data0 = Data1?D{min_commit = MinCommit},
     CurrentEpoch = Data0?D.epoch,
     case Epoch of
         CurrentEpoch ->
@@ -666,16 +684,22 @@ handle_event(cast,
              Data?D{timeout = replica_timeout(Timeout)}};
         _ ->
             Data = maybe_transition(Commit, Epoch, Data0),
-            {next_state, transitioning, Data}
+            Commits1 =
+                case self() =:= find_primary(Data?D.config, View) of
+                    false -> Commits;
+                    _ -> lists:replicate(length(Data?D.config), Commit)
+                end,
+            {next_state, transitioning, Data?D{commits = Commits1}}
     end;
 handle_event(cast,
              #msg{payload=#start_view_change{}, view=View, epoch=Epoch},
              normal,
              ?D{op = Op, view = OldView,
                 config = Config, log = Log0,
+                min_commit = MinCommit,
                 commit = Commit, timeout = Timeout} = Data) ->
     lager:info("~p start_view_change: ~p", [self(), View]),
-    Log = ship_log(Log0),
+    Log = ship_log(Log0, MinCommit),
     Primary = find_primary(Config, View), % use the new view
     lager:info("~p sending do view change ~p -> ~p to ~p",
                [self(), OldView, View, Primary]),
@@ -689,9 +713,10 @@ handle_event(cast,
              view_change,
              ?D{op = Op, view = OldView,
                 config = Config, log = Log0,
+                min_commit = MinCommit,
                 commit = Commit, timeout = Timeout} = Data) ->
     lager:info("~p start_view_change: ~p", [self(), View]),
-    Log = ship_log(Log0),
+    Log = ship_log(Log0, MinCommit),
     Primary = find_primary(Config, View), % use the new view
     lager:info("~p sending do view change ~p -> ~p to ~p",
                [self(), OldView, View, Primary]),
@@ -745,12 +770,6 @@ handle_event(cast,
             Pending1 = [Msg | Pending],
             {next_state, view_change, Data?D{pending_replies = Pending1}}
     end;
-%% handle_event(cast,
-%%              #msg{payload=#start_view{view = View}},
-%%              State,
-%%              ?D{view = View} = Data) ->
-%%     %% late, ignore
-%%     {next_state, State, Data};
 handle_event(cast,
              #msg{payload=#start_view{view = View, log = Log, op = Op,
                                       commit = Commit},
@@ -759,6 +778,7 @@ handle_event(cast,
              ?D{log = LocalLog, commit = LocalCommit,
                 config = Config, mod_state = ModState,
                 old_config = OldConfig, timeout = Timeout,
+                min_commit = MinCommit,
                 mod = Mod, next_state = NextState} = Data) ->
     %% replace log with Log, set op_num to highest op in the log, set
     %% view_num to View, if there are uncommitted operations in the
@@ -773,11 +793,18 @@ handle_event(cast,
                      {OldConfig, Config}, Commits),
     [prepare_ok(Primary, View, PrepOp, Epoch)
      || PrepOp <- lists:seq(Commit + 1, Op)],
+    MinCommits =
+        case AmPrimary of
+            false ->
+                [];
+            true ->
+                lists:duplicate(length(Config), MinCommit)
+        end,
     {next_state, normal,
      Data?D{op = Op, view = View,
             config = Config1, old_config = OldConfig1,
             mod_state = ModState1, next_state = NextState1,
-            primary = AmPrimary,
+            primary = AmPrimary, commits = MinCommits,
             timeout = select_timeout(AmPrimary, Timeout)}};
 handle_event(cast,
              #msg{payload=out_of_date, view = View, epoch = Epoch},
@@ -812,7 +839,10 @@ handle_event(cast,
                 op = Op, commit = Commit, epoch = Epoch} = Data) ->
     %% if primary, include additional information
     lager:info("recovery, primary to ~p", [Sender]),
-    Log = ship_log(Log0),
+    %% do we need to ship the entire log here?  We potentially have
+    %% this node's last min commit, so we could theoretically use
+    %% that.
+    Log = ship_log(Log0, 0),
     recovery_response(Sender, View, Nonce, Log, Op, Commit, Epoch),
     {next_state, normal, Data};
 handle_event(cast,
@@ -942,9 +972,10 @@ handle_event(info,
              normal,
              ?D{primary = true, view = View, epoch = Epoch,
                 commit = Commit, config = Config,
-                timeout = Timeout} = Data) ->
+                timeout = Timeout, commits = Commits} = Data) ->
     %% send commit message to all replicas
-    [commit(R, Commit, View, Epoch)
+    MinCommit = find_min_commit(Commits),
+    [commit(R, Commit, MinCommit, View, Epoch)
      || R <- Config, is_pid(R), R /= self()],
     {next_state, normal, Data?D{timeout = primary_timeout(Timeout)}};
 %% need to monitor primary and catch monitor failures here
@@ -1057,8 +1088,10 @@ add_request(Pid, #client{requests = Requests} = Client,
             Nothing when Nothing =< 0 ->
                Requests1;
             Take ->
-                {_, Req2} = maps:take(Take, Requests1),
-                Req2
+                case maps:take(Take, Requests1) of
+                    {_, Req2} -> Req2;
+                    _ -> Requests1
+                end
         end,
     maps:put(Pid, Client#client{requests = Requests2}, Table).
 
@@ -1190,8 +1223,12 @@ update_log_commit_state(Op, Log) ->
     lager:debug("setting ~p ~p to committed", [Op, Operation]),
     ets:insert(Log, Operation#operation{committed = true}).
 
-ship_log(Log) ->
-    ets:foldl(fun(X, Acc) -> [X|Acc] end, [], Log).
+ship_log(Log, MinCommit) ->
+    ets:foldl(fun(X = #operation{num = Commit}, Acc) when Commit >= MinCommit ->
+                      [X|Acc];
+                 (_, Acc) ->
+                      Acc
+              end, [], Log).
 
 trunc_uncommitted(Log, Commit) ->
     %% this is an operation, rather than the snapshot hack
@@ -1200,6 +1237,8 @@ trunc_uncommitted(Log, Commit) ->
 
 sync_log(OldCommit, OldLog, NewOpNum, NewLog) ->
     %% get a list of ops
+    %% TODO: do we need to take this return and process it before we
+    %% catchup at the next prepare/commit?
     Ops0 =
         [case ets:lookup(OldLog, Op) of
              %% we've never heard of this one, insert
@@ -1312,3 +1351,18 @@ stable_sort(Replicas) ->
     NRs =[{node(Replica), Replica} || Replica <- Replicas],
     lists:sort(NRs),
     [Replica || {_Nodename, Replica} <- NRs].
+
+%% this is a separate function in case we want to later change the
+%% implementation of the commit list
+find_min_commit(Commits) ->
+    lists:min(Commits).
+
+update_commits(Node, Config, Commit, Commits) ->
+    Zip = lists:zip(Config, Commits),
+    [ case Nd of
+          Node ->
+              Commit;
+          _ ->
+              Cmt
+     end
+     || {Nd, Cmt} <- Zip].
