@@ -53,17 +53,29 @@
     {error, Reason::term()}.
 
 %% any number of states can defined by the behavior, which must
-%% express them:
-%% Mod:StateName(Event::term(), Role::atom(), ModState::term()) ->
-%%     {next_state, NextStateName, UpdModState} |
-%%     {reply, Reply, NextStateName, UpdModState} |
-%%     {stop, UpdModState}.
+%% express them via handle_event/5
+-callback handle_event(Type, Event, Role, State, Data) ->
+    {next_state, State, Data} |
+    {next_state, State, Data, Actions} |
+    no_log |
+    {no_log, Actions} |
+    {stop, Reason, Data} when
+      Type :: call | cast | info,
+      Event :: any(),
+      Role :: primary | follower,
+      State :: atom(),
+      Data :: any(),
+      Actions :: [Action],
+      Reason :: any(),
+      Action :: {reply, Reply},
+      Reply :: any().
 
--callback serialize(State::term()) ->
+-callback serialize({State::term(), Data::term()}) ->
     {ok, SerializedState::term()} | {error, Reason::term()}.
 
 -callback deserialize(SerializedState::term()) ->
-    {ok, DeserializedState::term()} | {error, Reason::term()}.
+    {ok, {DeserializedState::term(), DeserializedData::term()}} |
+     {error, Reason::term()}.
 
 %% when we add leases, we want to be able to do no_transition
 %% operations from the primary without having to consult the replicas
@@ -71,7 +83,7 @@
 %% kv store. this optional callback will give a list of these states.
 %% -callback no_transition() -> [atom()].
 
--callback terminate(Reason::term(), State::term()) ->
+-callback terminate(Reason::term(), Data::term()) ->
     ok.
 
 -define(SERVER, ?MODULE).
@@ -147,8 +159,8 @@
 
           %% callback module state
           mod :: atom(),
-          next_state :: atom(),
-          mod_state :: term()
+          mod_state :: atom(),
+          mod_data :: term()
         }).
 
 -define(D, #replica_data).
@@ -318,23 +330,17 @@ init([Mod, ModArgs, New, _Opts]) ->
     rand:seed(exs64),
     case New of
         true ->
-            %% some ugly duplication here; is there a better way to do
-            %% this?
             case Mod:init(ModArgs) of
-                {ok, NextState, ModState} ->
+                %% eventually we should accept internal events here?
+                {ok, ModState, ModData} ->
                     State = ?D{mod = Mod,
-                               next_state = NextState,
-                               mod_state = ModState},
-                    add_snapshot({NextState, Mod:serialize(ModState)},
+                               mod_state = ModState,
+                               mod_data = ModData},
+                    add_snapshot({ModState, Mod:serialize(ModData)},
                                  0, State?D.log),
                     {ok, unconfigured, State};
-                {ok, NextState, ModState, Timeout} ->
-                    State = ?D{mod = Mod,
-                               next_state = NextState,
-                               mod_state = ModState},
-                    add_snapshot({NextState, Mod:serialize(ModState)},
-                                 0, State?D.log),
-                    {ok, unconfigured, State, Timeout}
+                {error, Reason} ->
+                    {error, Reason}
             end;
         false ->
             %% here we need to create a node without any
@@ -497,7 +503,7 @@ handle_event({call, From},
                     timeout = primary_timeout(Timeout)}}
     end;
 handle_event({call, From}, get_mod_state, normal,
-            ?D{next_state = Next, mod_state = Mod} = Data) ->
+            ?D{mod_state = Next, mod_data = Mod} = Data) ->
     %% TODO: we need to move to serialize here!
     {next_state, normal, Data, [{reply, From, {Next, Mod}}]};
 handle_event({call, From},
@@ -586,7 +592,7 @@ handle_event(cast,
              #msg{payload = #prepare_ok{op = Op},
                   sender = Sender} = Msg,
              State,
-             ?D{mod = Mod, next_state = NextState, mod_state = ModState,
+             ?D{mod = Mod, mod_state = ModState, mod_data = ModData,
                 client_table = Table, log = Log, view = View,
                 pending_replies = Pending, config = Config,
                 epoch = Epoch, commits = Commits} = Data)
@@ -623,24 +629,36 @@ handle_event(cast,
                      || Replica <- Config -- NewNodes,
                         Replica /= self(),
                         is_pid(Replica)],
-                    Reply = ok,
                     View1 = 0,
-                    NextState1 = NextState,
                     ModState1 = ModState,
+                    ModData1 = ModData,
+                    Actions = [{reply, ok}],
                     %% even it we're not the new primary, we can leave
                     %% our commits list as-is.
                     AmPrimary = self() =:= find_primary(NewConfig, 0);
                 _ ->
                     %% this needs to grow proper handling at some point
-                    {reply, Reply, NextState1, ModState1} =
-                        Mod:NextState(Command, ModState),
+                    Role = role(Data?D.primary),
+                    case Mod:handle_event(call, Command, Role, ModState, ModData) of
+                        {next_state, ModState1, ModData1} ->
+                            Actions = [];
+                        {next_state, ModState1, ModData1, Actions} ->
+                            ok;
+                        no_log ->
+                            ModState1 = ModState,
+                            ModData1 = ModData,
+                            Actions = [];
+                        {no_log, Actions} ->
+                            ModState1 = ModState,
+                            ModData1 = ModData
+                    end,
                     View1 = View,
                     Epoch1 = Epoch,
                     AmPrimary = true
             end,
             _ = update_log_commit_state(Op, Log),
             Interval = vrrm:config(snapshot_op_interval),
-            _ = maybe_compact(Op, Interval, Mod, {NextState1, ModState1}, Log),
+            _ = maybe_compact(Op, Interval, Mod, {ModState1, ModData}, Log),
             CliRec = get_client(Client, Table),
             ReqRec = get_request(CliRec, Request),
             lager:debug("cr = ~p req = ~p", [CliRec, ReqRec]),
@@ -650,14 +668,20 @@ handle_event(cast,
                     %% need to retry
                     ok;
                 From ->
-                    gen_statem:reply(From, {ok, Reply, Epoch})
+                    case Actions of
+                        %% this is all we support for now
+                        [{reply, Reply}] ->
+                            gen_statem:reply(From, {ok, Reply, Epoch}),
+                            _ = add_reply(Client, ReqRec#request.req_num, Reply, Table);
+                        _ ->
+                            ok
+                    end
             end,
-            _ = add_reply(Client, ReqRec#request.req_num, Reply, Table),
             Pending1 = clean_pend(prepare_ok, {Op, View}, Pending),
             %% do we need to check if commit == Op - 1?
             {next_state, normal,
              Data?D{commit = Op, epoch = Epoch1, view = View1,
-                    mod_state = ModState1, next_state = NextState1,
+                    mod_data = ModData1, mod_state = ModState1,
                     pending_replies = Pending1, primary = AmPrimary,
                     commits = Commits1}};
         _ ->
@@ -776,10 +800,10 @@ handle_event(cast,
                   epoch = Epoch},
              view_change,
              ?D{log = LocalLog, commit = LocalCommit,
-                config = Config, mod_state = ModState,
+                config = Config, mod_data = ModData,
                 old_config = OldConfig, timeout = Timeout,
                 min_commit = MinCommit,
-                mod = Mod, next_state = NextState} = Data) ->
+                mod = Mod, mod_state = ModState} = Data) ->
     %% replace log with Log, set op_num to highest op in the log, set
     %% view_num to View, if there are uncommitted operations in the
     %% log, send prepare_ok messages to the primary for them, commit
@@ -788,8 +812,9 @@ handle_event(cast,
     Primary = find_primary(Config, View),
     AmPrimary = Primary =:= self(),
     Commits = sync_log(LocalCommit, LocalLog, Op, Log),
-    {NextState1, ModState1, {OldConfig1, Config1}}
-        = do_upcalls(Mod, NextState, ModState, LocalLog,
+    {ModState1, ModData1, {OldConfig1, Config1}}
+        = do_upcalls(Mod, ModState, ModData, LocalLog,
+                     role(Data?D.primary),
                      {OldConfig, Config}, Commits),
     [prepare_ok(Primary, View, PrepOp, Epoch)
      || PrepOp <- lists:seq(Commit + 1, Op)],
@@ -803,7 +828,7 @@ handle_event(cast,
     {next_state, normal,
      Data?D{op = Op, view = View,
             config = Config1, old_config = OldConfig1,
-            mod_state = ModState1, next_state = NextState1,
+            mod_state = ModState1, mod_data = ModData1,
             primary = AmPrimary, commits = MinCommits,
             timeout = select_timeout(AmPrimary, Timeout)}};
 handle_event(cast,
@@ -851,7 +876,7 @@ handle_event(cast,
              recovering,
              ?D{log = LocalLog, commit = LocalCommit, mod = Mod,
                 config = Config, old_config = OldConfig,
-                next_state = NextState, mod_state = ModState,
+                mod_state = ModState, mod_data = ModData,
                 pending_replies = Pending,
                 timeout = Timeout} = Data) ->
     lager:info("recovery_response from ~p", [_Sender]),
@@ -868,8 +893,9 @@ handle_event(cast,
             %% if yes, use primary values, set to normal, restart participation
             _ = trunc_uncommitted(LocalLog, LocalCommit),
             Commits = sync_log(LocalCommit, LocalLog, Op, Log),
-            {NextState1, ModState1, {OldConfig1, Config1}} =
-                do_upcalls(Mod, NextState, ModState, LocalLog,
+            {ModState1, ModData1, {OldConfig1, Config1}} =
+                do_upcalls(Mod, ModState, ModData, LocalLog,
+                           role(Data?D.primary),
                            {OldConfig, Config}, Commits),
             Pending1 = clean_pend(recovery_response, Nonce, Pending),
             case Config1 =/= Config andalso
@@ -879,16 +905,16 @@ handle_event(cast,
                     %% replication, we need to check that we still
                     %% exist in the new system.
                     {stop, normal,
-                     Data?D{next_state = NextState1,
-                             mod_state = ModState1,
-                             pending_replies = Pending1}};
+                     Data?D{mod_state = ModState1,
+                            mod_data = ModData1,
+                            pending_replies = Pending1}};
                 _ ->
                     AmPrimary = self() == find_primary(Config1, View),
                     lager:info("recover successful"),
                     {next_state, normal,
                      Data?D{primary = AmPrimary,
-                            next_state = NextState1,
-                            mod_state = ModState1, op = Op,
+                            mod_state = ModState1,
+                            mod_data = ModData1, op = Op,
                             config = Config1, old_config = OldConfig1,
                             commit = Commit,
                             view = View, epoch = Epoch,
@@ -922,31 +948,32 @@ handle_event(cast,
     {ok, ST} = state_transfer(Source),
     lager:info("~p got transfer ~p from ~p", [self(), ST, Source]),
     _ = install_log(Log, ST#st.log),
-    {SnapOp, {NextState, ModState0}} =
+    {SnapOp, {ModState, ModData0}} =
         get_snapshot(Log),
-    ModState = Mod:deserialize(ModState0),
+    ModData = Mod:deserialize(ModData0),
+    AmPrimary = find_primary(NewConfig, 0),
     case SnapOp of
         Op ->
-            ModState1 = ModState,
-            NextState1 = NextState;
+            ModData1 = ModData,
+            ModState1 = ModState;
         _ ->
             %% we use ignore here because we cannot have two
             %% concurrent epoch changes in flight
-            {NextState1, ModState1, ignore}
-                = do_upcalls(Mod, NextState, ModState, Log,
+            {ModState1, ModData1, ignore}
+                = do_upcalls(Mod, ModState, ModData, Log,
+                             role(AmPrimary),
                              ignore, SnapOp + 1, ST#st.commit)
     end,
 
     %% send leaving nodes epoch_started
     [epoch_started(Replica, Epoch)
      || Replica <- OldConfig -- NewConfig, is_pid(Replica)],
-    AmPrimary = find_primary(NewConfig, 0),
     {next_state, normal,
      Data?D{epoch = Epoch, primary = AmPrimary,
             old_config = OldConfig, config = NewConfig,
             commit = ST#st.commit, op = Op,
-            view = 0, next_state = NextState1,
-            mod_state = ModState1}};
+            view = 0, mod_state = ModState1,
+            mod_data = ModData1}};
 handle_event(cast,
              #msg{payload = #epoch_started{} = Msg, epoch = Epoch},
              transitioning,
@@ -997,27 +1024,30 @@ handle_event(info,
 handle_event(info,
              timeout,
              normal,
-             ?D{mod = Mod, next_state = NextState,
-                mod_state = ModState} = Data) ->
-    case Mod:NextState(timeout, ModState) of
-        {next_state, NextState1, ModState1} ->
+             ?D{mod = Mod, mod_state = ModState,
+                primary = Primary, mod_data = ModData} = Data) ->
+    case Mod:handle_event(info, timeout, role(Primary), ModState, ModData) of
+        {next_state, ModState1, ModData1} ->
             {next_state, normal,
-             Data?D{next_state = NextState1,
-                    mod_state = ModState1}};
-        {stop, Reason, ModState1} ->
-            {stop, Reason, Data?D{mod_state = ModState1}}
+             Data?D{mod_state = ModState1,
+                    mod_data = ModData1}};
+        no_log ->
+            {next_state, normal, Data};
+        {stop, Reason, ModData1} ->
+            {stop, Reason, Data?D{mod_data = ModData1}}
     end;
 handle_event(info,
              Msg,
              normal,
-             ?D{mod = Mod, mod_state = ModState} = Data) ->
-    try Mod:handle_info(Msg, ModState) of
-        {next_state, NextState1, ModState1} ->
+             ?D{mod = Mod, mod_state = ModState,
+                mod_data = ModData, primary = Primary} = Data) ->
+    try Mod:handle_event(info, timeout, role(Primary), ModState, ModData) of
+        {next_state, ModState1, ModData1} ->
             {next_state, normal,
-             Data?D{next_state = NextState1,
-                    mod_state = ModState1}};
-        {stop, Reason, ModState1} ->
-            {stop, Reason, Data?D{mod_state = ModState1}}
+             Data?D{mod_state = ModState1,
+                    mod_data = ModData1}};
+        {stop, Reason, ModData1} ->
+            {stop, Reason, Data?D{mod_data = ModData1}}
     catch error:function_clause ->
             lager:warning("~p unexpected message ~p", [self(), Msg]),
             {next_state, normal, Data}
@@ -1124,48 +1154,54 @@ maybe_transition(Commit, Epoch, Data) ->
 maybe_catchup(Commit, ?D{commit = LocalCommit} = Data)
   when LocalCommit >= Commit ->
     Data;
-maybe_catchup(Commit, ?D{mod = Mod, next_state = NextState,
-                         mod_state = ModState, log = Log,
+maybe_catchup(Commit, ?D{mod = Mod, mod_state = ModState,
+                         mod_data = ModData, log = Log,
                          config = Config, old_config = OldConfig,
                          commit = LocalCommit} = Data) ->
-    {NextState1, ModState1, {OldConfig1, Config1}}
-        = do_upcalls(Mod, NextState, ModState, Log,
+    {ModState1, ModData1, {OldConfig1, Config1}}
+        = do_upcalls(Mod, ModState, ModData, Log,
+                     role(Data?D.primary),
                      {OldConfig, Config}, LocalCommit + 1, Commit),
-    Data?D{next_state = NextState1, mod_state = ModState1,
+    Data?D{mod_state = ModState1, mod_data = ModData1,
             config = Config1, old_config = OldConfig1,
             commit = Commit}.
 
-do_upcalls(Mod, NextState, ModState, Log, Configs, Start, Stop) ->
-    do_upcalls(Mod, NextState, ModState, Log, Configs, lists:seq(Start, Stop)).
+do_upcalls(Mod, ModState, ModData, Log, Role, Configs, Start, Stop) ->
+    do_upcalls(Mod, ModState, ModData, Log, Role, Configs, lists:seq(Start, Stop)).
 
-do_upcalls(Mod, NextState, ModState, Log, Configs, Commits) ->
-    lists:foldl(fun(Op, {NState, MState, Cfgs}) ->
-                        Entry = get_log_entry(Op, Log),
-                        case Entry#operation.command of
-                            %% ugh this is ugly
-                            {'$reconfigure', NewConfig} ->
-                                Cfgs1 =
-                                    case Cfgs of
-                                        ignore -> ignore;
-                                        {_, Config} ->
-                                            {Config, NewConfig}
-                                    end,
-                                {NState, MState, Cfgs1};
-                            Cmd ->
-                                case Mod:NState(Cmd, MState) of
-                                    {reply, _, NState1, MState1} ->
-                                        %% should be updating client table
-                                        %% here too?
-                                        update_log_commit_state(Op, Log),
-                                        {NState1, MState1, Cfgs};
-                                    {next_state, NState1, MState1} ->
-                                        update_log_commit_state(Op, Log),
-                                        {NState1, MState1, Cfgs}
-                                end
-                        end
-                end,
-                {NextState, ModState, Configs},
-                Commits).
+do_upcalls(Mod, ModState, ModData, Log, Role, Configs, Commits) ->
+    lists:foldl(
+      fun(Op, {MState, MData, Cfgs}) ->
+              Entry = get_log_entry(Op, Log),
+              case Entry#operation.command of
+                  %% ugh this is ugly
+                  {'$reconfigure', NewConfig} ->
+                      Cfgs1 =
+                          case Cfgs of
+                              ignore -> ignore;
+                              {_, Config} ->
+                                  {Config, NewConfig}
+                          end,
+                      {MState, MData, Cfgs1};
+                  Cmd ->
+                      %% We only support call for now
+                      case Mod:handle_event(call, Cmd, Role, MState, MData) of
+                          {next_state, MState1, MData1, _Actions} ->
+                              %% should be updating client table
+                              %% here too?
+                              %handle_actions(Entry, Actions),
+                              update_log_commit_state(Op, Log),
+                              {MState1, MData1, Cfgs};
+                          {next_state, MState1, MData1} ->
+                              update_log_commit_state(Op, Log),
+                              {MState1, MData1, Cfgs};
+                          {no_log, _Actions} ->
+                              {MState, MData, Cfgs}
+                      end
+              end
+      end,
+      {ModState, ModData, Configs},
+      Commits).
 
 f(Config) ->
     L = length(Config),
@@ -1354,6 +1390,8 @@ stable_sort(Replicas) ->
 
 %% this is a separate function in case we want to later change the
 %% implementation of the commit list
+find_min_commit([]) ->
+    0; % this is almost certainly not right but it is safe?
 find_min_commit(Commits) ->
     lists:min(Commits).
 
@@ -1366,3 +1404,8 @@ update_commits(Node, Config, Commit, Commits) ->
               Cmt
      end
      || {Nd, Cmt} <- Zip].
+
+role(true) ->
+    primary;
+role(_) ->
+    follower.

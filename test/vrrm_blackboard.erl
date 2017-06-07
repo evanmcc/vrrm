@@ -16,17 +16,12 @@
          terminate/2,
          serialize/1,
          deserialize/1,
-         handle_info/2
+         handle_event/5
         ]).
 
-%% states
--export([
-         accepting/2
-        ]).
+-define(D, #vrrm_blackboard_data).
 
--define(S, #vrrm_blackboard_state).
-
--record(vrrm_blackboard_state,
+-record(vrrm_blackboard_data,
         {
           board = #{} :: #{}
         }).
@@ -48,19 +43,19 @@ cas(Primary, Key, Current, New) ->
 %%% behavior
 
 init(_) ->
-    {ok, accepting, ?S{}}.
+    {ok, accepting, ?D{}}.
 
 terminate(_Reason, _State) ->
     ok.
 
 %% no side effects here
-serialize(State) ->
-    State.
+serialize(Data) ->
+    term_to_binary(Data).
 
-deserialize(State) ->
-    State.
+deserialize(Data) ->
+    binary_to_term(Data).
 
-accepting({get, Key}, ?S{board = Board} = State) ->
+handle_event(call, {get, Key}, _, accepting, ?D{board = Board}) ->
     Reply =
         case maps:find(Key, Board) of
             error ->
@@ -68,11 +63,7 @@ accepting({get, Key}, ?S{board = Board} = State) ->
             {ok, Val} ->
                 Val
         end,
-    {reply, Reply, accepting, State};
-accepting({put, Key, Val}, ?S{board = Board} = State) ->
+    {no_log, [{reply, Reply}]};
+handle_event(call, {put, Key, Val}, _, accepting, ?D{board = Board} = State) ->
     Board1 = maps:put(Key, Val, Board),
-    {reply, ok, accepting, State?S{board = Board1}}.
-
-
-handle_info(_, State) ->
-    {next_state, accepting, State}.
+    {next_state, accepting, State?D{board = Board1}, [{reply, ok}]}.

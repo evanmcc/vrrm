@@ -10,17 +10,16 @@ suite() ->
 
 init_per_suite(Config) ->
     application:ensure_all_started(lager),
-    application:load(vrrm),
-    lager:start(),
+    {ok, _} = application:ensure_all_started(vrrm),
 
     %% start several nodes
-    ErlFlags =  "-config ../../../../test/config/sys.config",
+    ErlFlags = "-config ../../../../test/config/sys.config",
         %%"-args_file ../../../../test/config/vm.args",
     ct:pal("path ~p", [os:cmd("pwd")]),
     CodePath = code:get_path(),
-    NodeName = list_to_atom("testrunner@" ++ hostname()),
+    NodeName = list_to_atom("testrunner"), % ++ hostname()),
     {ok, _Pid} = net_kernel:start([NodeName, shortnames]),
-    timer:sleep(2500),
+    timer:sleep(2000),
     Nodes =
         [begin
              N = integer_to_list(N0),
@@ -38,6 +37,7 @@ init_per_suite(Config) ->
                                     [lager, handlers,
                                      [{lager_file_backend,
                                        [{file, "console"++N++".log"}, {level, info}]}]]},
+                                   {application, ensure_all_started, [lager]},
                                    {application, ensure_all_started, [vrrm]}]},
                                  {erl_flags, ErlFlags}]),
              HostNode
@@ -45,8 +45,9 @@ init_per_suite(Config) ->
          || N0 <- lists:seq(1, 5)],
 
     [begin
-        true = net_kernel:hidden_connect_node(Node)%,
-        %pong = net_adm:ping(Node)
+         %%true = net_kernel:hidden_connect_node(Node)%,
+         pong = net_adm:ping(Node),
+         ok = rpc:call(Node, vrrm_app, swap_lager, [whereis(lager_event)])
      end
      || Node <- Nodes],
     [First | Rest] = Nodes,
@@ -115,6 +116,7 @@ bootstrap(Config) ->
                  [test_quorum, vrrm_blackboard, [], all]),
     ?assertEqual(ok, R),
     ok = wait_till_healthy(First),
+    ?assertEqual(foo, R),
     Config.
 
 start_dynamic(Config) ->
