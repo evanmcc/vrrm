@@ -18,9 +18,6 @@ init_per_suite(Config) ->
         %%"-args_file ../../../../test/config/vm.args",
     ct:pal("path ~p", [os:cmd("pwd")]),
     CodePath = code:get_path(),
-    NodeName = list_to_atom("testrunner@" ++ hostname()),
-    {ok, _Pid} = net_kernel:start([NodeName, shortnames]),
-    timer:sleep(2500),
     Nodes =
         [begin
              N = integer_to_list(N0),
@@ -58,7 +55,7 @@ hostname() ->
     string:strip(os:cmd("hostname"), right, $\n).
 
 test_node(N) ->
-    list_to_atom("test_sup_" ++ N). % ++ "@" ++ hostname()).
+    list_to_atom("test_sup_" ++ N ++ "@127.0.0.1").
 
 end_per_suite(Config) ->
     %% poorly behaved tests will leak processes here, we should expend
