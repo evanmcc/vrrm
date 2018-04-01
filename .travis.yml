@@ -7,7 +7,8 @@ matrix:
       otp_release: 19.3
     - os: linux
       otp_release: 20.0
-script: "./rebar3 ct"
+script:
+  - "rebar3 ct"
 branches:
   only:
     - master
