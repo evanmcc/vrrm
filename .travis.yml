@@ -10,7 +10,7 @@ matrix:
 script: "./rebar3 ct"
 branches:
   only:
-  - master
+    - master
 cache:
   directories:
-- "$HOME/.cache/rebar3/hex/default"
+    - "$HOME/.cache/rebar3/hex/default"
