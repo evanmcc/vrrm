@@ -1,0 +1,16 @@
+language: erlang
+matrix:
+  include:
+    - os: linux
+      otp_release: 18.3
+    - os: linux
+      otp_release: 19.3
+    - os: linux
+      otp_release: 20.0
+script: "./rebar3 ct"
+branches:
+  only:
+  - master
+cache:
+  directories:
+- "$HOME/.cache/rebar3/hex/default"
