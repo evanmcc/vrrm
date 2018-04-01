@@ -687,7 +687,7 @@ handle_event(cast,
             Commits1 =
                 case self() =:= find_primary(Data?D.config, View) of
                     false -> Commits;
-                    _ -> lists:replicate(length(Data?D.config), Commit)
+                    _ -> lists:duplicate(length(Data?D.config), Commit)
                 end,
             {next_state, transitioning, Data?D{commits = Commits1}}
     end;

@@ -2,13 +2,9 @@ language: erlang
 matrix:
   include:
     - os: linux
-      otp_release: 18.3
-    - os: linux
-      otp_release: 19.3
-    - os: linux
       otp_release: 20.0
 script:
-  - "rebar3 ct"
+  - "rebar3 do xref, ct, dialyzer"
 branches:
   only:
     - master
