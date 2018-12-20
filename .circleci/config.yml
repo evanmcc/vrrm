@@ -29,8 +29,8 @@ commands:
     #         &build_url=$CIRCLE_BUILD_URL\
     #         &slug=$CIRCLE_PROJECT_USERNAME/$CIRCLE_PROJECT_REPONAME\
     #         &pr=$CIRCLE_PR_NUMBER"
-jobs:
-  codecov:
+# jobs:
+#   codecov:
     # executor: rebar3/erlang
     # steps:
     #   - rebar3/install_ca_certs
