@@ -1,6 +1,6 @@
 #+TITLE: VRRM: just enough consensus
 
-[[https://travis-ci.org/evanmcc/vrrm.svg?branch=master]]
+[![CircleCI](https://circleci.com/gh/evanmcc/vrrm.svg?style=svg)](https://circleci.com/gh/evanmcc/vrrm)
 
 * DISCLAIMER
 calling this research quality code is an insult to research quality
